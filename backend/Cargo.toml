@@ -1,0 +1,27 @@
+[package]
+name = "com_caloptreyx_serversplitter"
+description = "Server Splitter extension for Calagopus"
+authors = ["Caloptreyx"]
+version = "1.1.4"
+edition = { workspace = true }
+
+[dependencies]
+shared = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+compact_str = { workspace = true }
+axum = { workspace = true }
+utoipa = { workspace = true }
+garde = { workspace = true }
+anyhow = { workspace = true }
+utoipa-axum = { workspace = true }
+rand = { workspace = true }
+tokio = { workspace = true }
+indexmap = { workspace = true }
+chrono-tz = { workspace = true }
+schema-extension-core = { workspace = true }
