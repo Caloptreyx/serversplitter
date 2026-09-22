@@ -683,18 +683,21 @@ export default function ServerSplitterPage() {
               min={0}
               value={createDatabases}
               onChange={(val) => setCreateDatabases(typeof val === 'number' ? val : 0)}
+              description={remaining ? `Available: ${remaining.feature_limits.databases}` : undefined}
             />
             <NumberInput
               label='Backups'
               min={0}
               value={createBackups}
               onChange={(val) => setCreateBackups(typeof val === 'number' ? val : 0)}
+              description={remaining ? `Available: ${remaining.feature_limits.backups}` : undefined}
             />
             <NumberInput
               label='Schedules'
               min={0}
               value={createSchedules}
               onChange={(val) => setCreateSchedules(typeof val === 'number' ? val : 0)}
+              description={remaining ? `Available: ${remaining.feature_limits.schedules}` : undefined}
             />
           </SimpleGrid>
 
@@ -804,18 +807,33 @@ export default function ServerSplitterPage() {
               min={0}
               value={editDatabases}
               onChange={(val) => setEditDatabases(typeof val === 'number' ? val : 0)}
+              description={
+                editingSubserver && remaining
+                  ? `Max: ${editingSubserver.featureLimits.databases + remaining.feature_limits.databases}`
+                  : undefined
+              }
             />
             <NumberInput
               label='Backups'
               min={0}
               value={editBackups}
               onChange={(val) => setEditBackups(typeof val === 'number' ? val : 0)}
+              description={
+                editingSubserver && remaining
+                  ? `Max: ${editingSubserver.featureLimits.backups + remaining.feature_limits.backups}`
+                  : undefined
+              }
             />
             <NumberInput
               label='Schedules'
               min={0}
               value={editSchedules}
               onChange={(val) => setEditSchedules(typeof val === 'number' ? val : 0)}
+              description={
+                editingSubserver && remaining
+                  ? `Max: ${editingSubserver.featureLimits.schedules + remaining.feature_limits.schedules}`
+                  : undefined
+              }
             />
           </SimpleGrid>
 
