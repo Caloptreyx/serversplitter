@@ -3,3 +3,6 @@ target
 dist
 exported-extensions
 AGENTS.md
+/backend/frontend
+/backend/migrations
+/backend/Metadata.toml
