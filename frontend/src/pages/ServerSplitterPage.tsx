@@ -1,25 +1,19 @@
 import {
   faArrowRight,
-  faEdit,
   faExclamationTriangle,
   faHdd,
   faInfoCircle,
   faMemory,
   faMicrochip,
-  faNetworkWired,
   faPlus,
   faServer,
-  faTrash,
-  faUsers,
 } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import {
   Alert,
-  Badge,
   Card,
   Group,
   NumberInput,
-  Progress,
   Select,
   SimpleGrid,
   Stack,
@@ -27,13 +21,13 @@ import {
   Text,
   TextInput,
   Title,
-  Tooltip,
 } from '@mantine/core';
 import { useEffect, useMemo, useState } from 'react';
 import { NavLink as Link } from 'react-router';
 import { httpErrorToHuman } from '@/api/axios.ts';
 import Button from '@/elements/buttons/Button.tsx';
 import ServerContentContainer from '@/elements/containers/ServerContentContainer.tsx';
+import StatCard from '@/elements/data-display/StatCard.tsx';
 import Spinner from '@/elements/feedback/Spinner.tsx';
 import ConfirmationModal from '@/elements/modals/ConfirmationModal.tsx';
 import { Modal, ModalFooter } from '@/elements/modals/Modal.tsx';
@@ -50,12 +44,19 @@ import {
   syncSubusers,
   updateSplit,
 } from '../api/client.ts';
+import SplitCard from '../components/SplitCard.tsx';
 
 function formatBytes(mb: number): string {
   if (mb >= 1024) {
     return `${(mb / 1024).toFixed(1)} GB`;
   }
   return `${mb} MB`;
+}
+
+/** StatCard props for a pool resource; `-1` means the master's resource is unlimited. */
+function poolStat(remaining: number, total: number, format: (value: number) => string) {
+  if (remaining === -1) return { value: 'Unlimited' };
+  return { value: format(remaining), limit: format(total), progress: total - remaining, total };
 }
 
 export default function ServerSplitterPage() {
@@ -297,7 +298,7 @@ export default function ServerSplitterPage() {
       }
       contentRight={
         canCreateMore ? (
-          <Button onClick={handleOpenCreate} color='blue' leftSection={<FontAwesomeIcon icon={faPlus} />}>
+          <Button onClick={handleOpenCreate} leftSection={<FontAwesomeIcon icon={faPlus} />}>
             Create Split
           </Button>
         ) : undefined
@@ -337,267 +338,70 @@ export default function ServerSplitterPage() {
         )}
 
         {maxSplits > 0 && subservers.length >= maxSplits && (
-          <Alert
-            icon={<FontAwesomeIcon icon={faInfoCircle} />}
-            title='Maximum Splits Reached'
-            color='indigo'
-            radius='md'
-          >
+          <Alert icon={<FontAwesomeIcon icon={faInfoCircle} />} title='Maximum Splits Reached' color='gray' radius='md'>
             You have reached the maximum allowed child servers ({maxSplits}). Delete an existing child server to reclaim
             split capacity.
           </Alert>
         )}
 
-        {/* Resource Pool Stat Cards */}
+        {/* Resource pool: what is still free to hand out to new splits */}
         {remaining && total && (
-          <SimpleGrid cols={{ base: 1, sm: 2, md: 4 }} spacing='md'>
-            {/* CPU */}
-            <Card padding='md' radius='md' withBorder>
-              <Group justify='space-between' mb='xs'>
-                <Text size='xs' c='dimmed' fw={700} tt='uppercase'>
-                  CPU Capacity
-                </Text>
-                <FontAwesomeIcon icon={faMicrochip} className='text-blue-400' />
-              </Group>
-              <Title order={3} fw={700} mb='xs'>
-                {remaining.cpu}%
-                <Text span size='sm' c='dimmed' fw={500}>
-                  {' '}
-                  / {total.cpu}% available
-                </Text>
-              </Title>
-              <Progress
-                value={total.cpu > 0 ? ((total.cpu - remaining.cpu) / total.cpu) * 100 : 0}
-                color='blue'
-                size='sm'
-                radius='xl'
-              />
-            </Card>
-
-            {/* Memory */}
-            <Card padding='md' radius='md' withBorder>
-              <Group justify='space-between' mb='xs'>
-                <Text size='xs' c='dimmed' fw={700} tt='uppercase'>
-                  RAM Capacity
-                </Text>
-                <FontAwesomeIcon icon={faMemory} className='text-emerald-400' />
-              </Group>
-              <Title order={3} fw={700} mb='xs'>
-                {formatBytes(remaining.memory)}
-                <Text span size='sm' c='dimmed' fw={500}>
-                  {' '}
-                  / {formatBytes(total.memory)} available
-                </Text>
-              </Title>
-              <Progress
-                value={total.memory > 0 ? ((total.memory - remaining.memory) / total.memory) * 100 : 0}
-                color='teal'
-                size='sm'
-                radius='xl'
-              />
-            </Card>
-
-            {/* Disk */}
-            <Card padding='md' radius='md' withBorder>
-              <Group justify='space-between' mb='xs'>
-                <Text size='xs' c='dimmed' fw={700} tt='uppercase'>
-                  Disk Space
-                </Text>
-                <FontAwesomeIcon icon={faHdd} className='text-purple-400' />
-              </Group>
-              <Title order={3} fw={700} mb='xs'>
-                {formatBytes(remaining.disk)}
-                <Text span size='sm' c='dimmed' fw={500}>
-                  {' '}
-                  / {formatBytes(total.disk)} available
-                </Text>
-              </Title>
-              <Progress
-                value={total.disk > 0 ? ((total.disk - remaining.disk) / total.disk) * 100 : 0}
-                color='grape'
-                size='sm'
-                radius='xl'
-              />
-            </Card>
-
-            {/* Splits count */}
-            <Card padding='md' radius='md' withBorder>
-              <Group justify='space-between' mb='xs'>
-                <Text size='xs' c='dimmed' fw={700} tt='uppercase'>
-                  Child Instances
-                </Text>
-                <FontAwesomeIcon icon={faNetworkWired} className='text-amber-400' />
-              </Group>
-              <Title order={3} fw={700} mb='xs'>
-                {subservers.length}
-                <Text span size='sm' c='dimmed' fw={500}>
-                  {' '}
-                  / {maxSplits} slots
-                </Text>
-              </Title>
-              <Progress
-                value={maxSplits > 0 ? (subservers.length / maxSplits) * 100 : 0}
-                color='orange'
-                size='sm'
-                radius='xl'
-              />
-            </Card>
-          </SimpleGrid>
+          <div className='grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4'>
+            <StatCard
+              icon={faMicrochip}
+              label='CPU available'
+              {...poolStat(remaining.cpu, total.cpu, (value) => `${value}%`)}
+            />
+            <StatCard
+              icon={faMemory}
+              label='Memory available'
+              {...poolStat(remaining.memory, total.memory, formatBytes)}
+            />
+            <StatCard icon={faHdd} label='Disk available' {...poolStat(remaining.disk, total.disk, formatBytes)} />
+            <StatCard
+              icon={faServer}
+              label='Splits'
+              value={String(subservers.length)}
+              limit={String(maxSplits)}
+              progress={subservers.length}
+              total={maxSplits}
+            />
+          </div>
         )}
 
-        {/* Child Servers List */}
         {!parentServer && (
           <div>
             <Title order={4} mb='md' fw={600}>
-              Child Servers ({subservers.length})
+              Splits
             </Title>
 
             {subservers.length === 0 ? (
-              <Card padding='xl' radius='md' withBorder className='text-center py-12'>
-                <Stack align='center' gap='md'>
-                  <div className='w-16 h-16 rounded-full bg-blue-500/10 flex items-center justify-center text-blue-400 text-2xl mb-1'>
-                    <FontAwesomeIcon icon={faServer} />
-                  </div>
-                  <div>
-                    <Text fw={600} size='lg'>
-                      No child servers created yet
-                    </Text>
-                    <Text size='sm' c='dimmed' maw={450} mx='auto' mt='xs'>
-                      Carve out dedicated resources from this server to launch separate child instances with their own
-                      console, files, and eggs.
-                    </Text>
-                  </div>
+              <Card padding='xl' radius='md' withBorder>
+                <Stack align='center' gap='xs' py='md'>
+                  <Text fw={600}>No splits yet</Text>
+                  <Text size='sm' c='dimmed' maw={440} ta='center'>
+                    Give part of this server&apos;s resources to a separate server with its own console, files and egg.
+                  </Text>
                   {canCreateMore && (
-                    <Button onClick={handleOpenCreate} color='blue' leftSection={<FontAwesomeIcon icon={faPlus} />}>
+                    <Button mt='sm' onClick={handleOpenCreate} leftSection={<FontAwesomeIcon icon={faPlus} />}>
                       Create Split
                     </Button>
                   )}
                 </Stack>
               </Card>
             ) : (
-              <SimpleGrid cols={{ base: 1, md: 2 }} spacing='md'>
-                {subservers.map((sub) => {
-                  const allocationStr = sub.allocation
-                    ? `${sub.allocation.ip}:${sub.allocation.port}`
-                    : 'No allocation';
-
-                  return (
-                    <Card key={sub.uuid} padding='lg' radius='md' withBorder shadow='sm'>
-                      <Stack gap='md'>
-                        {/* Card Header */}
-                        <Group justify='space-between' wrap='nowrap'>
-                          <div>
-                            <Group gap='xs'>
-                              <Title order={4} fw={600} lineClamp={1}>
-                                {sub.name}
-                              </Title>
-                              {sub.egg && (
-                                <Badge size='xs' variant='light' color='cyan'>
-                                  {sub.egg.name}
-                                </Badge>
-                              )}
-                            </Group>
-                            <Text size='xs' c='dimmed' mt={2}>
-                              {allocationStr}
-                            </Text>
-                          </div>
-                          <Badge size='sm' variant='dot' color={sub.isSuspended ? 'red' : 'green'}>
-                            {sub.isSuspended ? 'Suspended' : 'Active'}
-                          </Badge>
-                        </Group>
-
-                        {sub.description && (
-                          <Text size='xs' c='dimmed' lineClamp={2}>
-                            {sub.description}
-                          </Text>
-                        )}
-
-                        {/* Resource badges */}
-                        <SimpleGrid cols={3} spacing='xs'>
-                          <div className='bg-zinc-800/40 dark:bg-zinc-900/60 p-2.5 rounded-lg border border-zinc-700/30 text-center'>
-                            <Text size='xs' c='dimmed'>
-                              CPU
-                            </Text>
-                            <Text fw={700} size='sm'>
-                              {sub.limits.cpu}%
-                            </Text>
-                          </div>
-                          <div className='bg-zinc-800/40 dark:bg-zinc-900/60 p-2.5 rounded-lg border border-zinc-700/30 text-center'>
-                            <Text size='xs' c='dimmed'>
-                              Memory
-                            </Text>
-                            <Text fw={700} size='sm'>
-                              {formatBytes(sub.limits.memory)}
-                            </Text>
-                          </div>
-                          <div className='bg-zinc-800/40 dark:bg-zinc-900/60 p-2.5 rounded-lg border border-zinc-700/30 text-center'>
-                            <Text size='xs' c='dimmed'>
-                              Disk
-                            </Text>
-                            <Text fw={700} size='sm'>
-                              {formatBytes(sub.limits.disk)}
-                            </Text>
-                          </div>
-                        </SimpleGrid>
-
-                        {/* Feature limits pill */}
-                        <Group gap='xs'>
-                          <Badge size='xs' variant='outline' color='gray'>
-                            Ports: {sub.featureLimits.allocations}
-                          </Badge>
-                          <Badge size='xs' variant='outline' color='gray'>
-                            DBs: {sub.featureLimits.databases}
-                          </Badge>
-                          <Badge size='xs' variant='outline' color='gray'>
-                            Backups: {sub.featureLimits.backups}
-                          </Badge>
-                          <Badge size='xs' variant='outline' color='gray'>
-                            Schedules: {sub.featureLimits.schedules}
-                          </Badge>
-                        </Group>
-
-                        {/* Actions */}
-                        <Group justify='space-between' mt='xs'>
-                          <Link to={`/server/${sub.uuid}`}>
-                            <Button size='xs' color='blue' rightSection={<FontAwesomeIcon icon={faArrowRight} />}>
-                              Open Console
-                            </Button>
-                          </Link>
-
-                          <Group gap='xs'>
-                            <Tooltip label='Sync master server subusers & permissions to this child server'>
-                              <Button
-                                size='xs'
-                                variant='light'
-                                color='teal'
-                                loading={syncingSubusers === sub.uuid}
-                                onClick={() => handleSyncSubusers(sub)}
-                                leftSection={<FontAwesomeIcon icon={faUsers} />}
-                              >
-                                Sync Users
-                              </Button>
-                            </Tooltip>
-
-                            <Button
-                              size='xs'
-                              variant='light'
-                              color='gray'
-                              onClick={() => handleOpenEdit(sub)}
-                              leftSection={<FontAwesomeIcon icon={faEdit} />}
-                            >
-                              Resize
-                            </Button>
-
-                            <Button size='xs' variant='subtle' color='red' onClick={() => setServerToDelete(sub)}>
-                              <FontAwesomeIcon icon={faTrash} />
-                            </Button>
-                          </Group>
-                        </Group>
-                      </Stack>
-                    </Card>
-                  );
-                })}
-              </SimpleGrid>
+              <div className='grid grid-cols-1 lg:grid-cols-2 gap-4'>
+                {subservers.map((sub) => (
+                  <SplitCard
+                    key={sub.uuid}
+                    server={sub}
+                    syncing={syncingSubusers === sub.uuid}
+                    onResize={() => handleOpenEdit(sub)}
+                    onSyncUsers={() => handleSyncSubusers(sub)}
+                    onDelete={() => setServerToDelete(sub)}
+                  />
+                ))}
+              </div>
             )}
           </div>
         )}
