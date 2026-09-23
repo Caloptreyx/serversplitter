@@ -3,10 +3,11 @@ use crate::{
     settings::ServerSplitterSettingsData,
 };
 use axum::{extract::Path, http::StatusCode};
+use garde::Validate;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use shared::{
-    GetState, State,
+    ApiError, GetState, State,
     models::{
         BaseModel, ByUuid, CreatableModel, DeletableModel, IntoApiObject,
         nest::Nest,
@@ -60,9 +61,16 @@ pub struct ResourcesData {
 }
 
 #[derive(ToSchema, Serialize)]
+pub struct ParentServer {
+    pub uuid: uuid::Uuid,
+    pub name: compact_str::CompactString,
+}
+
+#[derive(ToSchema, Serialize)]
 pub struct ClientIndexResponse {
-    pub resources: ResourcesData,
-    pub master: ApiServer,
+    /// `None` when the server is itself a split: splits are managed from their master only.
+    pub resources: Option<ResourcesData>,
+    pub parent: Option<ParentServer>,
     pub servers: Vec<ApiServer>,
 }
 
@@ -73,14 +81,22 @@ pub struct NestEggItem {
     pub description: Option<compact_str::CompactString>,
 }
 
-#[derive(ToSchema, Deserialize)]
+#[derive(ToSchema, Validate, Deserialize)]
 pub struct FeatureLimitsInput {
+    #[garde(range(min = 1))]
+    #[schema(minimum = 1)]
     pub allocations: i32,
     #[serde(default)]
+    #[garde(range(min = 0))]
+    #[schema(minimum = 0)]
     pub databases: i32,
     #[serde(default)]
+    #[garde(range(min = 0))]
+    #[schema(minimum = 0)]
     pub backups: i32,
     #[serde(default)]
+    #[garde(range(min = 0))]
+    #[schema(minimum = 0)]
     pub schedules: i32,
 }
 
@@ -88,52 +104,112 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(ToSchema, Deserialize)]
+#[derive(ToSchema, Validate, Deserialize)]
 pub struct CreateSplitPayload {
+    #[garde(skip)]
     pub name: compact_str::CompactString,
+    #[garde(skip)]
     pub description: Option<compact_str::CompactString>,
+    #[garde(range(min = 0))]
+    #[schema(minimum = 0)]
     pub cpu: i32,
+    #[garde(range(min = 0))]
+    #[schema(minimum = 0)]
     pub memory: i64,
+    #[garde(range(min = 0))]
+    #[schema(minimum = 0)]
     pub disk: i64,
+    #[garde(dive)]
     pub feature_limits: FeatureLimitsInput,
+    #[garde(skip)]
     pub egg_uuid: Option<uuid::Uuid>,
     #[serde(default = "default_true")]
+    #[garde(skip)]
     pub sync_subusers: bool,
 }
 
-#[derive(ToSchema, Deserialize)]
+#[derive(ToSchema, Validate, Deserialize)]
 pub struct UpdateSplitPayload {
+    #[garde(skip)]
     pub name: Option<compact_str::CompactString>,
+    #[garde(skip)]
     pub description: Option<compact_str::CompactString>,
+    #[garde(range(min = 0))]
+    #[schema(minimum = 0)]
     pub cpu: Option<i32>,
+    #[garde(range(min = 0))]
+    #[schema(minimum = 0)]
     pub memory: Option<i64>,
+    #[garde(range(min = 0))]
+    #[schema(minimum = 0)]
     pub disk: Option<i64>,
+    #[garde(dive)]
     pub feature_limits: Option<FeatureLimitsInput>,
 }
 
-pub async fn resolve_parent(
-    state: &State,
-    current_server: &Server,
-) -> Result<(Server, ServerSplitterData), anyhow::Error> {
-    let current_data = current_server
+pub fn splitter_data(server: &Server) -> ServerSplitterData {
+    server
         .parse_model_extension::<ServerExtension>()
         .unwrap_or(ServerSplitterData {
             parent_uuid: None,
             splits: 0,
-        });
+        })
+}
 
-    if let Some(parent_uuid) = current_data.parent_uuid {
-        let parent = Server::by_uuid(&state.database, parent_uuid).await?;
-        let parent_data =
-            parent
-                .parse_model_extension::<ServerExtension>()
-                .unwrap_or(ServerSplitterData {
-                    parent_uuid: None,
-                    splits: 0,
-                });
-        Ok((parent, parent_data))
+/// Splits are managed only from their master server: permissions granted on a split must not
+/// reach the master's resource pool or its sibling splits.
+fn child_server_error() -> ApiResponseResult {
+    ApiResponse::error("Splits can only be managed from the master server.")
+        .with_status(StatusCode::FORBIDDEN)
+        .ok()
+}
+
+/// Rejects split sizes below the configured minimums. A limit of 0 means unlimited, so a split of
+/// a limited master gets at least 1 of that resource.
+fn resource_minimum_error(
+    config: &ServerSplitterSettingsData,
+    master_cpu: i32,
+    master_disk: i64,
+    cpu: i32,
+    memory: i64,
+    disk: i64,
+) -> Option<String> {
+    let min_cpu = config.reserved_cpu.max(1);
+    if master_cpu != 0 && cpu < min_cpu {
+        return Some(format!("CPU must be at least {min_cpu}%."));
+    }
+
+    let min_memory = config.reserved_memory.max(1);
+    if memory < min_memory {
+        return Some(format!("Memory must be at least {min_memory}MB."));
+    }
+
+    let min_disk = config.reserved_disk.max(1);
+    if master_disk != 0 && disk < min_disk {
+        return Some(format!("Disk must be at least {min_disk}MB."));
+    }
+
+    None
+}
+
+/// Egg for a new split: the master's egg needs a rule, and the requested egg (default: the
+/// master's own egg) must be one that rule allows.
+fn split_egg_uuid(
+    config: &ServerSplitterSettingsData,
+    master_egg: uuid::Uuid,
+    requested: Option<uuid::Uuid>,
+) -> Result<uuid::Uuid, &'static str> {
+    let rule = config
+        .egg_rules
+        .iter()
+        .find(|rule| rule.eggs.contains(&master_egg))
+        .ok_or("Splitting is not enabled for this server's egg.")?;
+
+    let egg = requested.unwrap_or(master_egg);
+    if rule.allowed_eggs.contains(&egg) {
+        Ok(egg)
     } else {
-        Ok((current_server.clone(), current_data))
+        Err("Invalid egg ID provided.")
     }
 }
 
@@ -168,6 +244,7 @@ pub async fn get_subservers(
     Ok(subservers)
 }
 
+/// `parent` must be a master server.
 pub async fn calculate_resources(
     state: &State,
     parent: &Server,
@@ -180,8 +257,7 @@ pub async fn calculate_resources(
         .cloned()
         .unwrap_or_default();
 
-    let disk_utilization_mb: i64 = if config.include_disk_usage && parent_data.parent_uuid.is_none()
-    {
+    let disk_utilization_mb: i64 = if config.include_disk_usage {
         if let Ok(node) = parent.node.fetch_cached(&state.database).await {
             if let Ok(resources_map) = node.fetch_server_resources(&state.database).await {
                 resources_map
@@ -198,28 +274,12 @@ pub async fn calculate_resources(
         0
     };
 
-    let negative_cpu = if parent_data.parent_uuid.is_none() {
-        config.reserved_cpu
-    } else {
-        0
-    };
-    let negative_memory = if parent_data.parent_uuid.is_none() {
-        config.reserved_memory
-    } else {
-        0
-    };
-    let negative_disk = if parent_data.parent_uuid.is_none() {
-        config.reserved_disk
-    } else {
-        0
-    };
-
     let sub_cpu = subserver.map(|s| s.cpu).unwrap_or(0);
     let sub_memory = subserver.map(|s| s.memory).unwrap_or(0);
     let sub_disk = subserver.map(|s| s.disk).unwrap_or(0);
 
-    let base_cpu = parent.cpu - negative_cpu + sub_cpu;
-    let base_disk = parent.disk - negative_disk - disk_utilization_mb + sub_disk;
+    let base_cpu = parent.cpu - config.reserved_cpu + sub_cpu;
+    let base_disk = parent.disk - config.reserved_disk - disk_utilization_mb + sub_disk;
 
     let (used_allocations, used_databases, used_backups, used_schedules) = tokio::try_join!(
         sqlx::query_scalar::<_, i64>(
@@ -273,7 +333,7 @@ pub async fn calculate_resources(
 
     let remaining = SplitterResourceLimits {
         cpu: if parent.cpu > 0 { base_cpu.max(0) } else { -1 },
-        memory: (parent.memory - negative_memory + sub_memory).max(0),
+        memory: (parent.memory - config.reserved_memory + sub_memory).max(0),
         disk: if parent.disk > 0 {
             base_disk.max(0)
         } else {
@@ -325,19 +385,34 @@ mod get_index {
     ) -> ApiResponseResult {
         permissions.has_server_permission("splitter.read")?;
 
-        let (parent, parent_data) = resolve_parent(&state, &server.0).await?;
-        let subservers = get_subservers(&state, parent.uuid).await?;
-        let resources = calculate_resources(&state, &parent, &parent_data, None).await?;
+        let server = server.0;
+        let data = splitter_data(&server);
 
-        let master_api = parent.into_api_object(&state, &user).await?;
+        // A split only learns which master it belongs to, not the master's pool or siblings.
+        if let Some(parent_uuid) = data.parent_uuid {
+            let master = Server::by_uuid(&state.database, parent_uuid).await?;
+            return ApiResponse::new_serialized(ClientIndexResponse {
+                resources: None,
+                parent: Some(ParentServer {
+                    uuid: master.uuid,
+                    name: master.name,
+                }),
+                servers: Vec::new(),
+            })
+            .ok();
+        }
+
+        let subservers = get_subservers(&state, server.uuid).await?;
+        let resources = calculate_resources(&state, &server, &data, None).await?;
+
         let mut servers_api = Vec::with_capacity(subservers.len());
         for sub in subservers {
             servers_api.push(sub.into_api_object(&state, &user).await?);
         }
 
         ApiResponse::new_serialized(ClientIndexResponse {
-            resources,
-            master: master_api,
+            resources: Some(resources),
+            parent: None,
             servers: servers_api,
         })
         .ok()
@@ -357,7 +432,10 @@ mod get_nests {
     ) -> ApiResponseResult {
         permissions.has_server_permission("splitter.read")?;
 
-        let (parent, _parent_data) = resolve_parent(&state, &server.0).await?;
+        let parent = server.0;
+        if splitter_data(&parent).parent_uuid.is_some() {
+            return child_server_error();
+        }
         let settings = state.settings.get().await?;
         let config: ServerSplitterSettingsData = settings
             .find_extension_settings::<ServerSplitterSettingsData>()
@@ -425,7 +503,17 @@ mod post_split {
     ) -> ApiResponseResult {
         permissions.has_server_permission("splitter.create")?;
 
-        let (parent, parent_data) = resolve_parent(&state, &server.0).await?;
+        if let Err(errors) = shared::utils::validate_data(&data) {
+            return ApiResponse::new_serialized(ApiError::new_strings_value(errors))
+                .with_status(StatusCode::BAD_REQUEST)
+                .ok();
+        }
+
+        let parent = server.0;
+        let parent_data = splitter_data(&parent);
+        if parent_data.parent_uuid.is_some() {
+            return child_server_error();
+        }
 
         // 1. Check split count limit
         let current_splits_count: i64 =
@@ -447,35 +535,15 @@ mod post_split {
             .cloned()
             .unwrap_or_default();
 
-        if parent.cpu != 0 && data.cpu < config.reserved_cpu {
-            return ApiResponse::error(format!(
-                "CPU must be at least {}% to create a split.",
-                config.reserved_cpu
-            ))
-            .with_status(StatusCode::BAD_REQUEST)
-            .ok();
-        }
-
-        if data.memory < config.reserved_memory {
-            return ApiResponse::error(format!(
-                "Memory must be at least {}MB to create a split.",
-                config.reserved_memory
-            ))
-            .with_status(StatusCode::BAD_REQUEST)
-            .ok();
-        }
-
-        if parent.disk != 0 && data.disk < config.reserved_disk {
-            return ApiResponse::error(format!(
-                "Disk must be at least {}MB to create a split.",
-                config.reserved_disk
-            ))
-            .with_status(StatusCode::BAD_REQUEST)
-            .ok();
-        }
-
-        if data.feature_limits.allocations < 1 {
-            return ApiResponse::error("Allocation limit must be at least 1.")
+        if let Some(error) = resource_minimum_error(
+            &config,
+            parent.cpu,
+            parent.disk,
+            data.cpu,
+            data.memory,
+            data.disk,
+        ) {
+            return ApiResponse::error(error)
                 .with_status(StatusCode::BAD_REQUEST)
                 .ok();
         }
@@ -526,24 +594,15 @@ mod post_split {
         }
 
         // 4. Resolve egg
-        let egg = if let Some(egg_uuid) = data.egg_uuid {
-            let allowed_uuids = config
-                .egg_rules
-                .iter()
-                .find(|rule| rule.eggs.contains(&parent.egg.uuid))
-                .map(|rule| &rule.allowed_eggs);
-
-            if let Some(allowed) = allowed_uuids
-                && !allowed.contains(&egg_uuid)
-            {
-                return ApiResponse::error("Invalid egg ID provided.")
+        let egg_uuid = match split_egg_uuid(&config, parent.egg.uuid, data.egg_uuid) {
+            Ok(egg_uuid) => egg_uuid,
+            Err(error) => {
+                return ApiResponse::error(error)
                     .with_status(StatusCode::BAD_REQUEST)
                     .ok();
             }
-            NestEgg::by_uuid(&state.database, egg_uuid).await?
-        } else {
-            *parent.egg.clone()
         };
+        let egg = NestEgg::by_uuid(&state.database, egg_uuid).await?;
 
         // 5. Select allocation on parent's node
         let node_model = parent.node.fetch_cached(&state.database).await?;
@@ -811,7 +870,17 @@ mod patch_split {
     ) -> ApiResponseResult {
         permissions.has_server_permission("splitter.update")?;
 
-        let (parent, parent_data) = resolve_parent(&state, &server.0).await?;
+        if let Err(errors) = shared::utils::validate_data(&data) {
+            return ApiResponse::new_serialized(ApiError::new_strings_value(errors))
+                .with_status(StatusCode::BAD_REQUEST)
+                .ok();
+        }
+
+        let parent = server.0;
+        let parent_data = splitter_data(&parent);
+        if parent_data.parent_uuid.is_some() {
+            return child_server_error();
+        }
 
         let split = match Server::by_uuid(&state.database, subserver_uuid).await {
             Ok(s) => s,
@@ -822,15 +891,7 @@ mod patch_split {
             }
         };
 
-        let split_data =
-            split
-                .parse_model_extension::<ServerExtension>()
-                .unwrap_or(ServerSplitterData {
-                    parent_uuid: None,
-                    splits: 0,
-                });
-
-        if split_data.parent_uuid != Some(parent.uuid) {
+        if splitter_data(&split).parent_uuid != Some(parent.uuid) {
             return ApiResponse::error("subserver does not belong to this parent server")
                 .with_status(StatusCode::BAD_REQUEST)
                 .ok();
@@ -867,28 +928,17 @@ mod patch_split {
             .cloned()
             .unwrap_or_default();
 
-        if parent.cpu != 0 && new_cpu < config.reserved_cpu {
-            return ApiResponse::error(format!("CPU must be at least {}%.", config.reserved_cpu))
+        if let Some(error) = resource_minimum_error(
+            &config,
+            parent.cpu,
+            parent.disk,
+            new_cpu,
+            new_memory,
+            new_disk,
+        ) {
+            return ApiResponse::error(error)
                 .with_status(StatusCode::BAD_REQUEST)
                 .ok();
-        }
-
-        if new_memory < config.reserved_memory {
-            return ApiResponse::error(format!(
-                "Memory must be at least {}MB.",
-                config.reserved_memory
-            ))
-            .with_status(StatusCode::BAD_REQUEST)
-            .ok();
-        }
-
-        if parent.disk != 0 && new_disk < config.reserved_disk {
-            return ApiResponse::error(format!(
-                "Disk must be at least {}MB.",
-                config.reserved_disk
-            ))
-            .with_status(StatusCode::BAD_REQUEST)
-            .ok();
         }
 
         let remaining = calculate_resources(&state, &parent, &parent_data, Some(&split)).await?;
@@ -1052,13 +1102,10 @@ mod delete_split {
     ) -> ApiResponseResult {
         permissions.has_server_permission("splitter.delete")?;
 
-        if server.0.uuid == subserver_uuid {
-            return ApiResponse::error("Cannot delete current server.")
-                .with_status(StatusCode::BAD_REQUEST)
-                .ok();
+        let parent = server.0;
+        if splitter_data(&parent).parent_uuid.is_some() {
+            return child_server_error();
         }
-
-        let (parent, _parent_data) = resolve_parent(&state, &server.0).await?;
 
         let split = match Server::by_uuid(&state.database, subserver_uuid).await {
             Ok(s) => s,
@@ -1069,15 +1116,7 @@ mod delete_split {
             }
         };
 
-        let split_data =
-            split
-                .parse_model_extension::<ServerExtension>()
-                .unwrap_or(ServerSplitterData {
-                    parent_uuid: None,
-                    splits: 0,
-                });
-
-        if split_data.parent_uuid != Some(parent.uuid) {
+        if splitter_data(&split).parent_uuid != Some(parent.uuid) {
             return ApiResponse::error("subserver does not belong to this parent server")
                 .with_status(StatusCode::BAD_REQUEST)
                 .ok();
@@ -1120,7 +1159,10 @@ mod sync_subusers {
     ) -> ApiResponseResult {
         permissions.has_server_permission("splitter.update")?;
 
-        let (parent, _parent_data) = resolve_parent(&state, &server.0).await?;
+        let parent = server.0;
+        if splitter_data(&parent).parent_uuid.is_some() {
+            return child_server_error();
+        }
 
         let split = match Server::by_uuid(&state.database, subserver_uuid).await {
             Ok(s) => s,
@@ -1131,15 +1173,7 @@ mod sync_subusers {
             }
         };
 
-        let split_data =
-            split
-                .parse_model_extension::<ServerExtension>()
-                .unwrap_or(ServerSplitterData {
-                    parent_uuid: None,
-                    splits: 0,
-                });
-
-        if split_data.parent_uuid != Some(parent.uuid) {
+        if splitter_data(&split).parent_uuid != Some(parent.uuid) {
             return ApiResponse::error("subserver does not belong to this parent server")
                 .with_status(StatusCode::BAD_REQUEST)
                 .ok();
@@ -1200,4 +1234,152 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .routes(routes!(delete_split::route))
         .routes(routes!(sync_subusers::route))
         .with_state(state.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::EggRule;
+
+    fn create_payload(feature_limits: serde_json::Value) -> CreateSplitPayload {
+        serde_json::from_value(serde_json::json!({
+            "name": "split",
+            "cpu": 100,
+            "memory": 1024,
+            "disk": 2048,
+            "feature_limits": feature_limits,
+        }))
+        .unwrap()
+    }
+
+    fn update_payload(value: serde_json::Value) -> UpdateSplitPayload {
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn reserved(cpu: i32, memory: i64, disk: i64) -> ServerSplitterSettingsData {
+        ServerSplitterSettingsData {
+            reserved_cpu: cpu,
+            reserved_memory: memory,
+            reserved_disk: disk,
+            ..Default::default()
+        }
+    }
+
+    // Negative limits on a split are subtracted from the master, raising its limits.
+    #[test]
+    fn payloads_reject_negative_feature_limits() {
+        for field in ["databases", "backups", "schedules"] {
+            let limits = serde_json::json!({ "allocations": 1, field: -100 });
+            assert!(
+                create_payload(limits.clone()).validate().is_err(),
+                "create {field}"
+            );
+            assert!(
+                update_payload(serde_json::json!({ "feature_limits": limits }))
+                    .validate()
+                    .is_err(),
+                "update {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn payloads_require_an_allocation() {
+        for allocations in [0, -5] {
+            let limits = serde_json::json!({ "allocations": allocations });
+            assert!(create_payload(limits.clone()).validate().is_err());
+            assert!(
+                update_payload(serde_json::json!({ "feature_limits": limits }))
+                    .validate()
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn payloads_reject_negative_resources() {
+        for field in ["cpu", "memory", "disk"] {
+            assert!(
+                update_payload(serde_json::json!({ field: -1 }))
+                    .validate()
+                    .is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn payloads_accept_valid_and_partial_updates() {
+        assert!(
+            create_payload(serde_json::json!({ "allocations": 1, "databases": 0 }))
+                .validate()
+                .is_ok()
+        );
+        assert!(update_payload(serde_json::json!({})).validate().is_ok());
+    }
+
+    // 0 means unlimited: a limited master must not hand out an unlimited split, even with no
+    // reservation configured.
+    #[test]
+    fn limited_master_cannot_create_unlimited_split() {
+        let config = reserved(0, 0, 0);
+        assert!(resource_minimum_error(&config, 400, 10_000, 0, 512, 512).is_some());
+        assert!(resource_minimum_error(&config, 400, 10_000, 50, 0, 512).is_some());
+        assert!(resource_minimum_error(&config, 400, 10_000, 50, 512, 0).is_some());
+        assert!(resource_minimum_error(&config, 400, 10_000, 1, 1, 1).is_none());
+    }
+
+    #[test]
+    fn unlimited_master_may_create_unlimited_cpu_and_disk() {
+        let config = reserved(0, 0, 0);
+        assert!(resource_minimum_error(&config, 0, 0, 0, 512, 0).is_none());
+    }
+
+    #[test]
+    fn reserved_amount_is_the_minimum_split_size() {
+        let config = reserved(10, 128, 256);
+        assert!(resource_minimum_error(&config, 400, 10_000, 9, 128, 256).is_some());
+        assert!(resource_minimum_error(&config, 400, 10_000, 10, 127, 256).is_some());
+        assert!(resource_minimum_error(&config, 400, 10_000, 10, 128, 255).is_some());
+        assert!(resource_minimum_error(&config, 400, 10_000, 10, 128, 256).is_none());
+    }
+
+    #[test]
+    fn split_egg_requires_a_rule_for_the_master_egg() {
+        let (master, other, allowed) = (
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+            uuid::Uuid::new_v4(),
+        );
+        let config = ServerSplitterSettingsData {
+            egg_rules: vec![EggRule {
+                id: uuid::Uuid::new_v4(),
+                eggs: vec![master],
+                allowed_eggs: vec![allowed],
+            }],
+            ..Default::default()
+        };
+
+        // No rule for the master's egg: splitting is off, whatever egg is requested.
+        assert!(split_egg_uuid(&config, other, Some(allowed)).is_err());
+        assert!(split_egg_uuid(&config, other, None).is_err());
+        // A rule exists: only its allowed eggs, and the default is not exempt.
+        assert!(split_egg_uuid(&config, master, Some(other)).is_err());
+        assert!(split_egg_uuid(&config, master, None).is_err());
+        assert_eq!(split_egg_uuid(&config, master, Some(allowed)), Ok(allowed));
+    }
+
+    #[test]
+    fn split_egg_defaults_to_the_master_egg_when_allowed() {
+        let master = uuid::Uuid::new_v4();
+        let config = ServerSplitterSettingsData {
+            egg_rules: vec![EggRule {
+                id: uuid::Uuid::new_v4(),
+                eggs: vec![master],
+                allowed_eggs: vec![master],
+            }],
+            ..Default::default()
+        };
+        assert_eq!(split_egg_uuid(&config, master, None), Ok(master));
+    }
 }

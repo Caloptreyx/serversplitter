@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { axiosInstance } from '@/api/axios.ts';
-import { parseFromApi } from '@/lib/serialization/api-transform.ts';
 import { serverSchema } from '@/lib/schemas/server/server.ts';
+import { parseFromApi } from '@/lib/serialization/api-transform.ts';
 
 export type Server = z.infer<typeof serverSchema>;
 
@@ -80,11 +80,15 @@ export interface NestEggItem {
   description: string | null;
 }
 
+export interface ParentServer {
+  uuid: string;
+  name: string;
+}
+
 export interface SplitterClientIndex {
-  resources: ResourcesData;
-  master?: Server;
-  servers?: Server[];
-  parent: Server | null;
+  /** `null` on a child server: splits are managed from the master server only. */
+  resources: ResourcesData | null;
+  parent: ParentServer | null;
   subservers: Server[];
 }
 
@@ -121,15 +125,10 @@ export interface UpdateSplitPayload {
 // Client API Calls
 export async function getClientSplitter(serverUuid: string): Promise<SplitterClientIndex> {
   const { data } = await axiosInstance.get(`/api/client/servers/${serverUuid}/splitter`);
-  const rawServers: unknown[] = data.subservers ?? data.servers ?? [];
-  const rawParent = data.parent ?? (data.master?.uuid !== serverUuid ? data.master : null) ?? null;
-  const parsedServers = rawServers.map((s) => parseFromApi(serverSchema, s));
   return {
     resources: data.resources,
-    master: data.master ? parseFromApi(serverSchema, data.master) : undefined,
-    servers: parsedServers,
-    parent: rawParent ? parseFromApi(serverSchema, rawParent) : null,
-    subservers: parsedServers,
+    parent: data.parent,
+    subservers: data.servers.map((s: unknown) => parseFromApi(serverSchema, s)),
   };
 }
 
