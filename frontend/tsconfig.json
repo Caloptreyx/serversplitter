@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "moduleResolution": "bundler",
+    "module": "esnext",
+    "target": "esnext",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "paths": {
+      "@/*": [
+        "../../calagopus-dev/frontend/src/*",
+        "../../../frontend/src/*"
+      ]
+    },
+    "skipLibCheck": true,
+    "resolvePackageJsonExports": true
+  },
+  "include": [
+    "src",
+    "../../calagopus-dev/frontend/src/vite-env.d.ts",
+    "../../../frontend/src/vite-env.d.ts"
+  ]
+}
