@@ -94,6 +94,21 @@ export interface SplitterClientIndex {
   subservers: Server[];
 }
 
+export interface SplitSummary {
+  uuid: string;
+  name: string;
+  cpu: number;
+  memory: number;
+  disk: number;
+}
+
+export interface AdminServerSplits {
+  /** The master server, when this server is itself a split. */
+  parent: ParentServer | null;
+  /** This server's splits, when it is a master server. */
+  splits: SplitSummary[];
+}
+
 export interface CreateSplitPayload {
   name: string;
   description?: string;
@@ -182,4 +197,9 @@ export async function updateAdminEggRule(ruleId: string, payload: UpdateEggRuleP
 
 export async function deleteAdminEggRule(ruleId: string): Promise<void> {
   await axiosInstance.delete(`/api/admin/extensions/com.caloptreyx.serversplitter/egg-rules/${ruleId}`);
+}
+
+export async function getAdminServerSplits(serverUuid: string): Promise<AdminServerSplits> {
+  const { data } = await axiosInstance.get(`/api/admin/extensions/com.caloptreyx.serversplitter/servers/${serverUuid}`);
+  return data;
 }

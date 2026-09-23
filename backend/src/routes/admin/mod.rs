@@ -1,11 +1,14 @@
-use crate::settings::{EggRule, ServerSplitterSettingsData};
+use crate::{
+    routes::client::{ParentServer, get_subservers, splitter_data},
+    settings::{EggRule, ServerSplitterSettingsData},
+};
 use axum::{extract::Path, http::StatusCode};
 use serde::{Deserialize, Serialize};
 use shared::{
     GetState, State,
     models::{
-        BaseModel, admin_activity::GetAdminActivityLogger, nest::Nest, nest_egg::NestEgg,
-        user::GetPermissionManager,
+        BaseModel, ByUuid, admin_activity::GetAdminActivityLogger, nest::Nest, nest_egg::NestEgg,
+        server::Server, user::GetPermissionManager,
     },
     response::{ApiResponse, ApiResponseResult},
 };
@@ -21,6 +24,23 @@ pub struct EggItem {
     pub name: compact_str::CompactString,
     pub nest_uuid: uuid::Uuid,
     pub nest_name: compact_str::CompactString,
+}
+
+#[derive(ToSchema, Serialize)]
+pub struct SplitSummary {
+    pub uuid: uuid::Uuid,
+    pub name: compact_str::CompactString,
+    pub cpu: i32,
+    pub memory: i64,
+    pub disk: i64,
+}
+
+#[derive(ToSchema, Serialize)]
+pub struct ServerSplitsResponse {
+    /// The master server, when this server is itself a split.
+    pub parent: Option<ParentServer>,
+    /// This server's splits, when it is a master server.
+    pub splits: Vec<SplitSummary>,
 }
 
 #[derive(ToSchema, Serialize)]
@@ -291,6 +311,59 @@ mod delete_egg_rule {
     }
 }
 
+mod get_server_splits {
+    use super::*;
+
+    #[utoipa::path(get, path = "/servers/{server}", responses(
+        (status = OK, body = inline(ServerSplitsResponse)),
+    ))]
+    pub async fn route(
+        state: GetState,
+        permissions: GetPermissionManager,
+        Path(server_uuid): Path<uuid::Uuid>,
+    ) -> ApiResponseResult {
+        permissions.has_admin_permission("servers.read")?;
+
+        let server = match Server::by_uuid(&state.database, server_uuid).await {
+            Ok(server) => server,
+            Err(_) => {
+                return ApiResponse::error("server not found")
+                    .with_status(StatusCode::NOT_FOUND)
+                    .ok();
+            }
+        };
+
+        let response = match splitter_data(&server).parent_uuid {
+            Some(parent_uuid) => {
+                let master = Server::by_uuid(&state.database, parent_uuid).await?;
+                ServerSplitsResponse {
+                    parent: Some(ParentServer {
+                        uuid: master.uuid,
+                        name: master.name,
+                    }),
+                    splits: Vec::new(),
+                }
+            }
+            None => ServerSplitsResponse {
+                parent: None,
+                splits: get_subservers(&state, server.uuid)
+                    .await?
+                    .into_iter()
+                    .map(|split| SplitSummary {
+                        uuid: split.uuid,
+                        name: split.name,
+                        cpu: split.cpu,
+                        memory: split.memory,
+                        disk: split.disk,
+                    })
+                    .collect(),
+            },
+        };
+
+        ApiResponse::new_serialized(response).ok()
+    }
+}
+
 pub fn router(state: &State) -> OpenApiRouter<State> {
     OpenApiRouter::new()
         .routes(routes!(get_settings::route))
@@ -298,5 +371,6 @@ pub fn router(state: &State) -> OpenApiRouter<State> {
         .routes(routes!(post_egg_rule::route))
         .routes(routes!(put_egg_rule::route))
         .routes(routes!(delete_egg_rule::route))
+        .routes(routes!(get_server_splits::route))
         .with_state(state.clone())
 }
