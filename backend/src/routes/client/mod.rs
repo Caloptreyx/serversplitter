@@ -770,7 +770,8 @@ mod post_split {
         // 7. Mark parent_uuid on split server and decrement parent resources
         let mut transaction = state.database.write().begin().await?;
 
-        sqlx::query("UPDATE servers SET parent_uuid = $1 WHERE uuid = $2")
+        // a split never gets splits of its own: they are managed from the master only
+        sqlx::query("UPDATE servers SET parent_uuid = $1, splits = 0 WHERE uuid = $2")
             .bind(parent.uuid)
             .bind(split.uuid)
             .execute(&mut *transaction)

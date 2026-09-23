@@ -20,6 +20,10 @@ pub struct ServerSplitterSettingsData {
     pub include_disk_usage: bool,
     pub display_reserved_limits: bool,
     pub egg_rules: Vec<EggRule>,
+    /// Split limit given to new servers created without an explicit `splits` feature limit.
+    /// Defaulted so configs saved before this field existed still load.
+    #[serde(default)]
+    pub default_splits: i32,
 }
 
 impl Default for ServerSplitterSettingsData {
@@ -31,6 +35,7 @@ impl Default for ServerSplitterSettingsData {
             include_disk_usage: true,
             display_reserved_limits: true,
             egg_rules: Vec::new(),
+            default_splits: 0,
         }
     }
 }
@@ -57,5 +62,21 @@ impl SettingsDeserializeExt for ServerSplitterSettingsDeserializer {
             .read_serde_setting("config")
             .unwrap_or_default();
         Ok(Box::new(data))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A config saved before `default_splits` existed must still load: a failed load falls back
+    // to the defaults, which would silently drop every egg rule.
+    #[test]
+    fn config_saved_before_default_splits_keeps_its_values() {
+        let stored = r#"{"reserved_cpu":10,"reserved_memory":128,"reserved_disk":256,"include_disk_usage":true,"display_reserved_limits":true,"egg_rules":[{"id":"18a6ac64-df1b-4b2c-a327-8dd4e79a3ffb","eggs":["10664c3a-30a1-402b-a7f9-b2c45fb7a58f"],"allowed_eggs":["10664c3a-30a1-402b-a7f9-b2c45fb7a58f"]}]}"#;
+
+        let config: ServerSplitterSettingsData = serde_json::from_str(stored).unwrap();
+        assert_eq!(config.egg_rules.len(), 1);
+        assert_eq!(config.default_splits, 0);
     }
 }

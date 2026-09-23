@@ -45,6 +45,7 @@ export default function AdminServerSplitterPage() {
   const [reservedDisk, setReservedDisk] = useState<number>(0);
   const [includeDiskUsage, setIncludeDiskUsage] = useState(false);
   const [displayReservedLimits, setDisplayReservedLimits] = useState(true);
+  const [defaultSplits, setDefaultSplits] = useState<number>(0);
 
   // Egg Rules Modals State
   const [isRuleModalOpen, setIsRuleModalOpen] = useState(false);
@@ -66,6 +67,7 @@ export default function AdminServerSplitterPage() {
       setReservedDisk(data.reserved_disk);
       setIncludeDiskUsage(data.include_disk_usage);
       setDisplayReservedLimits(data.display_reserved_limits);
+      setDefaultSplits(data.default_splits);
     } catch (err) {
       addToast(httpErrorToHuman(err), 'error');
     } finally {
@@ -96,6 +98,7 @@ export default function AdminServerSplitterPage() {
         reserved_disk: Number(reservedDisk),
         include_disk_usage: includeDiskUsage,
         display_reserved_limits: displayReservedLimits,
+        default_splits: Number(defaultSplits),
       });
       addToast('Settings saved successfully', 'success');
       await loadSettings();
@@ -240,6 +243,21 @@ export default function AdminServerSplitterPage() {
                   onChange={(val) => setReservedDisk(typeof val === 'number' ? val : 0)}
                 />
               </SimpleGrid>
+
+              <Divider my='sm' />
+
+              <Title order={4} fw={600}>
+                New Servers
+              </Title>
+
+              <NumberInput
+                label='Default Split Limit'
+                description='Split limit applied to new servers unless overridden.'
+                min={0}
+                w={220}
+                value={defaultSplits}
+                onChange={(val) => setDefaultSplits(typeof val === 'number' ? val : 0)}
+              />
 
               <Divider my='sm' />
 

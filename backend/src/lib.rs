@@ -36,23 +36,31 @@ impl Extension for ExtensionStruct {
         // 1. Register ModelExtension
         Server::register_model_extension(model::ServerExtension);
 
-        // 2. Register Server CREATE handler (for splits feature limit)
+        // 2. Register Server CREATE handler: `feature_limits.splits` from the payload, else the
+        //    configured default split limit
         Server::register_create_handler(
             ListenerPriority::Normal,
-            |options, query_builder, _state, _transaction| {
+            |options, query_builder, state, _transaction| {
                 Box::pin(async move {
-                    if let Ok(extended) = options
+                    let splits = match options
                         .feature_limits
                         .parse_extended::<model::ExtendedApiServerFeatureLimits>()
+                        .ok()
+                        .and_then(|extended| extended.splits)
                     {
-                        if let Some(value) = extended.splits {
-                            query_builder.set("splits", value);
-                        } else {
-                            query_builder.set("splits", 0);
-                        }
-                    } else {
-                        query_builder.set("splits", 0);
-                    }
+                        Some(splits) => splits,
+                        None => state
+                            .settings
+                            .get()
+                            .await
+                            .and_then(|settings| {
+                                settings
+                                    .find_extension_settings::<settings::ServerSplitterSettingsData>()
+                                    .map(|config| config.default_splits)
+                            })
+                            .unwrap_or(0),
+                    };
+                    query_builder.set("splits", splits.max(0));
                     Ok(())
                 })
             },

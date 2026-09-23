@@ -30,6 +30,7 @@ pub struct SettingsResponse {
     pub reserved_disk: i64,
     pub include_disk_usage: bool,
     pub display_reserved_limits: bool,
+    pub default_splits: i32,
     pub egg_rules: Vec<EggRule>,
     pub eggs: Vec<EggItem>,
 }
@@ -41,6 +42,7 @@ pub struct UpdateSettingsPayload {
     pub reserved_disk: i64,
     pub include_disk_usage: bool,
     pub display_reserved_limits: bool,
+    pub default_splits: i32,
 }
 
 #[derive(ToSchema, Deserialize)]
@@ -101,6 +103,7 @@ mod get_settings {
             reserved_disk: ext_settings.reserved_disk,
             include_disk_usage: ext_settings.include_disk_usage,
             display_reserved_limits: ext_settings.display_reserved_limits,
+            default_splits: ext_settings.default_splits,
             egg_rules: ext_settings.egg_rules.clone(),
             eggs,
         })
@@ -122,6 +125,12 @@ mod put_settings {
     ) -> ApiResponseResult {
         permissions.has_admin_permission("extensions.splitter.write")?;
 
+        if data.default_splits < 0 {
+            return ApiResponse::error("Default split limit cannot be negative.")
+                .with_status(StatusCode::BAD_REQUEST)
+                .ok();
+        }
+
         let mut settings = state.settings.get_mut().await?;
         let ext_settings: &mut ServerSplitterSettingsData =
             settings.find_mut_extension_settings()?;
@@ -131,6 +140,7 @@ mod put_settings {
         ext_settings.reserved_disk = data.reserved_disk;
         ext_settings.include_disk_usage = data.include_disk_usage;
         ext_settings.display_reserved_limits = data.display_reserved_limits;
+        ext_settings.default_splits = data.default_splits;
 
         settings.save().await?;
 
@@ -143,6 +153,7 @@ mod put_settings {
                     "reserved_disk": data.reserved_disk,
                     "include_disk_usage": data.include_disk_usage,
                     "display_reserved_limits": data.display_reserved_limits,
+                    "default_splits": data.default_splits,
                 }),
             )
             .await;

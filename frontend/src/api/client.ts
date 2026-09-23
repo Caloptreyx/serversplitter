@@ -24,6 +24,7 @@ export interface AdminSettingsResponse {
   reserved_disk: number;
   include_disk_usage: boolean;
   display_reserved_limits: boolean;
+  default_splits: number;
   egg_rules: EggRule[];
   eggs: EggItem[];
 }
@@ -34,6 +35,7 @@ export interface UpdateAdminSettingsPayload {
   reserved_disk: number;
   include_disk_usage: boolean;
   display_reserved_limits: boolean;
+  default_splits: number;
 }
 
 export interface CreateEggRulePayload {
