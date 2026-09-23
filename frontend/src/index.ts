@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { type FieldDef, insertFieldsAfter } from '@/elements/form-engine/index.ts';
 import { nullableNumber } from '@/lib/serialization/transformers.ts';
 import AdminServerSplitsCard from './components/AdminServerSplitsCard.tsx';
+import AdminSplitNotice from './components/AdminSplitNotice.tsx';
 import AdminServerSplitterPage from './pages/AdminServerSplitterPage.tsx';
 import ServerSplitterPage from './pages/ServerSplitterPage.tsx';
 
@@ -25,6 +26,8 @@ class ComCaloptreyxServerSplitterExtension extends Extension {
 
     // 2. Admin server Overview: which master a split belongs to, or which splits a master has
     ctx.extensionRegistry.pages.admin.servers.view.overview.appendedCards.appendComponent(AdminServerSplitsCard);
+    // ...and a notice under the title of every admin page of a split
+    ctx.extensionRegistry.pages.admin.servers.container.prependContentComponent(AdminSplitNotice);
 
     // 3. Extend admin server forms with the splits limit field
     ctx.extensionRegistry.enterForms((forms) => {
