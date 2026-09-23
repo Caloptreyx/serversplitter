@@ -5,7 +5,6 @@ import {
   Card,
   Divider,
   Group,
-  MultiSelect,
   NumberInput,
   SimpleGrid,
   Stack,
@@ -31,6 +30,7 @@ import {
   updateAdminEggRule,
   updateAdminSplitterSettings,
 } from '../api/client.ts';
+import EggTreePicker from '../components/EggTreePicker.tsx';
 
 export default function AdminServerSplitterPage() {
   const { addToast } = useToast();
@@ -85,14 +85,6 @@ export default function AdminServerSplitterPage() {
       }
     }
     return map;
-  }, [settings?.eggs]);
-
-  const eggMultiSelectData = useMemo(() => {
-    if (!settings?.eggs) return [];
-    return settings.eggs.map((egg) => ({
-      value: egg.uuid,
-      label: `${egg.name} (${egg.nest_name})`,
-    }));
   }, [settings?.eggs]);
 
   const handleSaveSettings = async () => {
@@ -376,32 +368,36 @@ export default function AdminServerSplitterPage() {
         opened={isRuleModalOpen}
         onClose={() => setIsRuleModalOpen(false)}
         title={editingRule ? 'Edit Egg Rule' : 'New Egg Rule'}
-        size='lg'
+        size='xl'
       >
         <Stack gap='md'>
-          <MultiSelect
-            label='Master Eggs'
-            placeholder='Select parent eggs'
-            description='Servers using any of these eggs will have this rule applied'
-            required
-            searchable
-            clearable
-            data={eggMultiSelectData}
-            value={selectedEggs}
-            onChange={setSelectedEggs}
-          />
+          <SimpleGrid cols={{ base: 1, md: 2 }} spacing='lg'>
+            <EggTreePicker
+              label='Master Eggs'
+              description='Servers using any of these eggs get this rule'
+              eggs={settings?.eggs ?? []}
+              value={selectedEggs}
+              onChange={setSelectedEggs}
+            />
 
-          <MultiSelect
-            label='Allowed Child Eggs'
-            placeholder='Select allowed eggs for child splits'
-            description='Users will be allowed to select any of these eggs when creating splits'
-            required
-            searchable
-            clearable
-            data={eggMultiSelectData}
-            value={selectedAllowedEggs}
-            onChange={setSelectedAllowedEggs}
-          />
+            <EggTreePicker
+              label='Allowed Child Eggs'
+              description='Eggs users can pick when creating a split'
+              eggs={settings?.eggs ?? []}
+              value={selectedAllowedEggs}
+              onChange={setSelectedAllowedEggs}
+              actions={
+                <Button
+                  size='xs'
+                  variant='light'
+                  disabled={selectedEggs.length === 0}
+                  onClick={() => setSelectedAllowedEggs(selectedEggs)}
+                >
+                  Same as master eggs
+                </Button>
+              }
+            />
+          </SimpleGrid>
 
           <ModalFooter>
             <Button variant='default' onClick={() => setIsRuleModalOpen(false)}>
