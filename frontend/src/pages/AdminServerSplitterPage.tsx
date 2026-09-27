@@ -1,3 +1,4 @@
+import { faDiscord } from '@fortawesome/free-brands-svg-icons';
 import { faCog, faEdit, faEgg, faPlus, faSave, faTrash } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import {
@@ -5,6 +6,7 @@ import {
   Card,
   Divider,
   Group,
+  Button as MantineButton,
   NumberInput,
   SimpleGrid,
   Stack,
@@ -188,6 +190,16 @@ export default function AdminServerSplitterPage() {
             Configure master resource reservations and egg permission rules.
           </Text>
         </div>
+        <MantineButton
+          component='a'
+          href='https://discord.gg/4qjMWU7S8x'
+          target='_blank'
+          rel='noopener noreferrer'
+          variant='default'
+          leftSection={<FontAwesomeIcon icon={faDiscord} />}
+        >
+          Support & feature requests
+        </MantineButton>
       </Group>
 
       <Tabs defaultValue='general'>
