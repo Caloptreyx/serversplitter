@@ -685,6 +685,8 @@ mod post_split {
             pinned_cpus: Vec::new(),
             startup,
             image,
+            // container labels are admin set per server (1.2.3); a split starts without the master's
+            labels: Default::default(),
             timezone,
             hugepages_passthrough_enabled: master.hugepages_passthrough_enabled,
             kvm_passthrough_enabled: master.kvm_passthrough_enabled,
