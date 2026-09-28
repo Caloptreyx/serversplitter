@@ -3,14 +3,15 @@ use shared::{
     Extendible, State,
     extensions::{Extension, ExtensionPermissionsBuilder, ExtensionRouteBuilder},
     models::{
-        BaseModel, ByUuid, CreatableModel, DeletableModel, ListenerPriority, UpdatableModel,
-        server::{ApiServerFeatureLimits, Server},
+        BaseModel, CreatableModel, DeletableModel, ListenerPriority, UpdatableModel,
+        server::{ApiServerFeatureLimits, DeleteServerOptions, Server},
     },
     permissions::PermissionGroup,
 };
 use std::sync::Arc;
 
 pub mod model;
+pub mod pool;
 pub mod routes;
 pub mod settings;
 
@@ -19,29 +20,43 @@ pub struct ExtensionStruct;
 
 #[async_trait::async_trait]
 impl Extension for ExtensionStruct {
-    async fn initialize(&mut self, state: State) {
+    async fn initialize(&mut self, _state: State) {
         tracing::info!("Server Splitter extension initialized");
-
-        // Safe DDL initialization fallback
-        let _ = sqlx::query(
-            r#"
-            ALTER TABLE "servers" ADD COLUMN IF NOT EXISTS "parent_uuid" UUID REFERENCES "servers"("uuid") ON DELETE CASCADE;
-            ALTER TABLE "servers" ADD COLUMN IF NOT EXISTS "splits" INTEGER NOT NULL DEFAULT 0;
-            CREATE INDEX IF NOT EXISTS "servers_parent_uuid_idx" ON "servers"("parent_uuid");
-            "#,
-        )
-        .execute(state.database.write())
-        .await;
 
         // 1. Register ModelExtension
         Server::register_model_extension(model::ServerExtension);
 
-        // 2. Register Server CREATE handler: `feature_limits.splits` from the payload, else the
-        //    configured default split limit
+        // 2. Register Server CREATE handler. A split is inserted already linked to its master,
+        //    taking over the master's allocation in the same transaction. Other servers get
+        //    `feature_limits.splits` from the payload, else the configured default split limit.
         Server::register_create_handler(
             ListenerPriority::Normal,
-            |options, query_builder, state, _transaction| {
+            |options, query_builder, state, transaction| {
                 Box::pin(async move {
+                    if let Ok(pending) = pool::PENDING_SPLIT.try_with(|pending| *pending) {
+                        query_builder
+                            .set("parent_uuid", pending.master_uuid)
+                            .set("splits", 0);
+
+                        if let Some(server_allocation) = pending.transferred_server_allocation {
+                            let moved = sqlx::query(
+                                "DELETE FROM server_allocations WHERE uuid = $1 AND server_uuid = $2",
+                            )
+                            .bind(server_allocation)
+                            .bind(pending.master_uuid)
+                            .execute(&mut **transaction)
+                            .await?;
+                            if moved.rows_affected() != 1 {
+                                return Err(anyhow::anyhow!(
+                                    "the master's allocation changed while creating the split"
+                                )
+                                .into());
+                            }
+                        }
+
+                        return Ok(());
+                    }
+
                     let splits = match options
                         .feature_limits
                         .parse_extended::<model::ExtendedApiServerFeatureLimits>()
@@ -83,55 +98,39 @@ impl Extension for ExtensionStruct {
             },
         );
 
-        // 4. Register Server DELETE handlers
+        // 4. Register Server DELETE handler. Runs inside the panel's delete transaction, which
+        //    commits only once Wings has deleted the server.
         Server::register_delete_handler(
             ListenerPriority::Normal,
-            |server, _options, _state, transaction| {
+            |server, options, state, transaction| {
                 Box::pin(async move {
-                    if let Ok(ext) = server.parse_model_extension::<model::ServerExtension>()
-                        && let Some(parent_uuid) = ext.parent_uuid
-                    {
-                        let _ = sqlx::query(
-                                r#"
-                                UPDATE servers
-                                SET
-                                    cpu = CASE WHEN cpu > 0 AND $1 > 0 THEN cpu + $1 ELSE cpu END,
-                                    memory = memory + $2,
-                                    disk = CASE WHEN disk > 0 AND $3 > 0 THEN disk + $3 ELSE disk END,
-                                    allocation_limit = allocation_limit + $4,
-                                    database_limit = database_limit + $5,
-                                    backup_limit = backup_limit + $6,
-                                    schedule_limit = schedule_limit + $7
-                                WHERE uuid = $8
-                                "#,
-                            )
-                            .bind(server.cpu)
-                            .bind(server.memory)
-                            .bind(server.disk)
-                            .bind(server.allocation_limit)
-                            .bind(server.database_limit)
-                            .bind(server.backup_limit)
-                            .bind(server.schedule_limit)
-                            .bind(parent_uuid)
-                            .execute(&mut **transaction)
-                            .await;
-                    }
-                    Ok(())
-                })
-            },
-        );
+                    let data = routes::client::splitter_data(server);
 
-        Server::register_after_delete_handler(
-            ListenerPriority::Normal,
-            |server, _options, state, _transaction| {
-                Box::pin(async move {
-                    if let Ok(ext) = server.parse_model_extension::<model::ServerExtension>()
-                        && let Some(parent_uuid) = ext.parent_uuid
-                        && let Ok(parent) = Server::by_uuid(&state.database, parent_uuid).await
-                    {
-                        let database_arc = std::sync::Arc::new(state.database.clone());
-                        parent.batch_sync(&database_arc).await;
+                    // A split: return what it holds to its master, under the master's lock so a
+                    // concurrent resize is credited at its committed size, then push the master's
+                    // new limits to Wings once this transaction ends.
+                    if let Some(parent_uuid) = data.parent_uuid {
+                        if pool::lock_master(transaction, parent_uuid).await?.is_some() {
+                            pool::credit_master(transaction, server.uuid).await?;
+                            pool::refresh_and_sync_after_unlock(state.clone(), parent_uuid);
+                        }
+                        return Ok(());
                     }
+
+                    // A master: delete its splits properly first. Removing their rows along with
+                    // the master would leave their containers running on Wings and their
+                    // databases on the database hosts.
+                    for split in routes::client::get_subservers(state, server.uuid).await? {
+                        split
+                            .delete(
+                                state,
+                                DeleteServerOptions {
+                                    force: options.force,
+                                },
+                            )
+                            .await?;
+                    }
+
                     Ok(())
                 })
             },

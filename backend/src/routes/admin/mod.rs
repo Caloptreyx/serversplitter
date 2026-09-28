@@ -151,6 +151,12 @@ mod put_settings {
                 .ok();
         }
 
+        if data.reserved_cpu < 0 || data.reserved_memory < 0 || data.reserved_disk < 0 {
+            return ApiResponse::error("Reserved limits cannot be negative.")
+                .with_status(StatusCode::BAD_REQUEST)
+                .ok();
+        }
+
         let mut settings = state.settings.get_mut().await?;
         let ext_settings: &mut ServerSplitterSettingsData =
             settings.find_mut_extension_settings()?;
@@ -320,17 +326,15 @@ mod get_server_splits {
     pub async fn route(
         state: GetState,
         permissions: GetPermissionManager,
-        Path(server_uuid): Path<uuid::Uuid>,
+        Path(server_identifier): Path<String>,
     ) -> ApiResponseResult {
         permissions.has_admin_permission("servers.read")?;
 
-        let server = match Server::by_uuid(&state.database, server_uuid).await {
-            Ok(server) => server,
-            Err(_) => {
-                return ApiResponse::error("server not found")
-                    .with_status(StatusCode::NOT_FOUND)
-                    .ok();
-            }
+        // admin server pages are reached by full uuid or short id
+        let Some(server) = Server::by_identifier(&state.database, &server_identifier).await? else {
+            return ApiResponse::error("server not found")
+                .with_status(StatusCode::NOT_FOUND)
+                .ok();
         };
 
         let response = match splitter_data(&server).parent_uuid {

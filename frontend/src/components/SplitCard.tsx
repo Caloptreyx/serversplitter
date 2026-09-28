@@ -21,6 +21,7 @@ import ScrollingText from '@/elements/ScrollingText.tsx';
 import { formatAllocation, statusToColor } from '@/lib/domain/server.ts';
 import { bytesToString, mbToBytes } from '@/lib/format/size.ts';
 import { useServerStats } from '@/plugins/server/useServerStats.ts';
+import { useServerCan } from '@/plugins/usePermissions.ts';
 import type { Server } from '../api/client.ts';
 
 // Keep clicks on the card's own controls from following the card link. React events bubble
@@ -64,6 +65,8 @@ export default function SplitCard({
   onDelete: () => void;
 }) {
   const stats = useServerStats(server);
+  const canUpdate = useServerCan('splitter.update');
+  const canDelete = useServerCan('splitter.delete');
 
   const cpuLimit = server.limits.cpu !== 0 ? `${server.limits.cpu}%` : 'Unlimited';
   const memoryLimit = server.limits.memory !== 0 ? bytesToString(mbToBytes(server.limits.memory)) : 'Unlimited';
@@ -94,32 +97,40 @@ export default function SplitCard({
               </CopyOnClick>
             )}
 
-            <Menu position='bottom-end' shadow='md' width={220}>
-              <Menu.Target>
-                <ActionIcon
-                  size='input-sm'
-                  variant='light'
-                  color='gray'
-                  loading={syncing}
-                  aria-label={`Actions for ${server.name}`}
-                  onClick={stopLink}
-                >
-                  <FontAwesomeIcon icon={faEllipsisVertical} />
-                </ActionIcon>
-              </Menu.Target>
-              <Menu.Dropdown onClick={stopLink}>
-                <Menu.Item leftSection={<FontAwesomeIcon icon={faSliders} />} onClick={onResize}>
-                  Resize
-                </Menu.Item>
-                <Menu.Item leftSection={<FontAwesomeIcon icon={faUsers} />} onClick={onSyncUsers}>
-                  Sync users from master
-                </Menu.Item>
-                <Menu.Divider />
-                <Menu.Item color='red' leftSection={<FontAwesomeIcon icon={faTrash} />} onClick={onDelete}>
-                  Delete split
-                </Menu.Item>
-              </Menu.Dropdown>
-            </Menu>
+            {(canUpdate || canDelete) && (
+              <Menu position='bottom-end' shadow='md' width={220}>
+                <Menu.Target>
+                  <ActionIcon
+                    size='input-sm'
+                    variant='light'
+                    color='gray'
+                    loading={syncing}
+                    aria-label={`Actions for ${server.name}`}
+                    onClick={stopLink}
+                  >
+                    <FontAwesomeIcon icon={faEllipsisVertical} />
+                  </ActionIcon>
+                </Menu.Target>
+                <Menu.Dropdown onClick={stopLink}>
+                  {canUpdate && (
+                    <>
+                      <Menu.Item leftSection={<FontAwesomeIcon icon={faSliders} />} onClick={onResize}>
+                        Resize
+                      </Menu.Item>
+                      <Menu.Item leftSection={<FontAwesomeIcon icon={faUsers} />} onClick={onSyncUsers}>
+                        Sync users from master
+                      </Menu.Item>
+                    </>
+                  )}
+                  {canUpdate && canDelete && <Menu.Divider />}
+                  {canDelete && (
+                    <Menu.Item color='red' leftSection={<FontAwesomeIcon icon={faTrash} />} onClick={onDelete}>
+                      Delete split
+                    </Menu.Item>
+                  )}
+                </Menu.Dropdown>
+              </Menu>
+            )}
           </div>
         </div>
 

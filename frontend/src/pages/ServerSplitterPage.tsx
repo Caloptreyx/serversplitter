@@ -31,6 +31,7 @@ import StatCard from '@/elements/data-display/StatCard.tsx';
 import Spinner from '@/elements/feedback/Spinner.tsx';
 import ConfirmationModal from '@/elements/modals/ConfirmationModal.tsx';
 import { Modal, ModalFooter } from '@/elements/modals/Modal.tsx';
+import { useServerCan } from '@/plugins/usePermissions.ts';
 import { useToast } from '@/providers/ToastProvider.tsx';
 import { useServerStore } from '@/stores/server.ts';
 import {
@@ -39,6 +40,7 @@ import {
   getClientSplitter,
   getClientSplitterNests,
   type NestEggItem,
+  type ResourcesData,
   type Server,
   type SplitterClientIndex,
   syncSubusers,
@@ -58,6 +60,38 @@ function poolStat(remaining: number, total: number, format: (value: number) => s
   if (remaining === -1) return { value: 'Unlimited' };
   return { value: format(remaining), limit: format(total), progress: total - remaining, total };
 }
+
+type PoolResource = 'cpu' | 'memory' | 'disk';
+
+interface Bounds {
+  min: number;
+  /** `undefined` when the master is unlimited for this resource. */
+  max: number | undefined;
+}
+
+/**
+ * Bounds the backend accepts for a split's cpu/memory/disk. `current` is the split's existing value
+ * when resizing (its share returns to the pool, and keeping it is always accepted), `undefined` when creating.
+ */
+function resourceBounds(resources: ResourcesData, key: PoolResource, current?: number): Bounds {
+  const remaining = resources.remaining[key];
+  // A limited master requires each split to be limited too; an unlimited one allows 0 (= unlimited).
+  const minimum = resources.total[key] > 0 ? Math.max(resources.reserved[key], 1) : 0;
+  const min = current === undefined ? minimum : Math.min(minimum, current);
+  const max = remaining === -1 ? undefined : (current ?? 0) + remaining;
+  return { min, max };
+}
+
+function defaultWithin(preferred: number, { min, max }: Bounds): number {
+  return Math.max(min, max === undefined ? preferred : Math.min(preferred, max));
+}
+
+function boundsText(prefix: string, { min, max }: Bounds, format: (value: number) => string): string {
+  const upper = max === undefined ? 'Unlimited' : format(max);
+  return min === 0 ? `${prefix}: ${upper} (0 = unlimited)` : `${prefix}: ${upper}`;
+}
+
+const formatPercent = (value: number) => `${value}%`;
 
 export default function ServerSplitterPage() {
   const currentServer = useServerStore((state) => state.server);
@@ -147,17 +181,17 @@ export default function ServerSplitterPage() {
     return options;
   }, [nestsData]);
 
+  const canCreate = useServerCan('splitter.create');
+
   const handleOpenCreate = () => {
-    if (!data?.resources) return;
-    const maxCpu = Math.max(1, data.resources.remaining_display.cpu);
-    const maxMem = Math.max(256, data.resources.remaining_display.memory);
-    const maxDisk = Math.max(512, data.resources.remaining_display.disk);
+    const resources = data?.resources;
+    if (!resources) return;
 
     setCreateName('');
     setCreateDescription('');
-    setCreateCpu(Math.min(100, maxCpu));
-    setCreateMemory(Math.min(1024, maxMem));
-    setCreateDisk(Math.min(2048, maxDisk));
+    setCreateCpu(defaultWithin(100, resourceBounds(resources, 'cpu')));
+    setCreateMemory(defaultWithin(1024, resourceBounds(resources, 'memory')));
+    setCreateDisk(defaultWithin(2048, resourceBounds(resources, 'disk')));
     setCreateAllocations(1);
     setCreateDatabases(0);
     setCreateBackups(0);
@@ -221,7 +255,8 @@ export default function ServerSplitterPage() {
       setSubmitting(true);
       await updateSplit(currentServer.uuid, editingSubserver.uuid, {
         name: editName.trim() || undefined,
-        description: editDescription.trim() || undefined,
+        // Always sent: an empty string clears the description.
+        description: editDescription.trim(),
         cpu: Number(editCpu),
         memory: Number(editMemory),
         disk: Number(editDisk),
@@ -279,12 +314,37 @@ export default function ServerSplitterPage() {
     );
   }
 
-  const remaining = data?.resources?.remaining_display;
-  const total = data?.resources?.total;
+  const resources = data?.resources ?? null;
+  const pool = resources?.remaining_display;
+  const remaining = resources?.remaining;
+  const total = resources?.total;
   const subservers = data?.subservers ?? [];
   const parentServer = data?.parent ?? null;
   const maxSplits = total?.feature_limits.splits ?? 0;
-  const canCreateMore = maxSplits > 0 && subservers.length < maxSplits;
+  const canCreateMore = canCreate && maxSplits > 0 && subservers.length < maxSplits;
+
+  const createBounds = resources
+    ? {
+        cpu: resourceBounds(resources, 'cpu'),
+        memory: resourceBounds(resources, 'memory'),
+        disk: resourceBounds(resources, 'disk'),
+      }
+    : null;
+  const editBounds =
+    resources && editingSubserver
+      ? {
+          cpu: resourceBounds(resources, 'cpu', editingSubserver.limits.cpu),
+          memory: resourceBounds(resources, 'memory', editingSubserver.limits.memory),
+          disk: resourceBounds(resources, 'disk', editingSubserver.limits.disk),
+          allocations:
+            editingSubserver.featureLimits.allocations +
+            resources.remaining.feature_limits.allocations -
+            (resources.transferable_allocation ? 1 : 0),
+          databases: editingSubserver.featureLimits.databases + resources.remaining.feature_limits.databases,
+          backups: editingSubserver.featureLimits.backups + resources.remaining.feature_limits.backups,
+          schedules: editingSubserver.featureLimits.schedules + resources.remaining.feature_limits.schedules,
+        }
+      : null;
 
   return (
     <ServerContentContainer
@@ -345,19 +405,15 @@ export default function ServerSplitterPage() {
         )}
 
         {/* Resource pool: what is still free to hand out to new splits */}
-        {remaining && total && (
+        {pool && total && (
           <div className='grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4'>
             <StatCard
               icon={faMicrochip}
               label='CPU available'
-              {...poolStat(remaining.cpu, total.cpu, (value) => `${value}%`)}
+              {...poolStat(pool.cpu, total.cpu, (value) => `${value}%`)}
             />
-            <StatCard
-              icon={faMemory}
-              label='Memory available'
-              {...poolStat(remaining.memory, total.memory, formatBytes)}
-            />
-            <StatCard icon={faHdd} label='Disk available' {...poolStat(remaining.disk, total.disk, formatBytes)} />
+            <StatCard icon={faMemory} label='Memory available' {...poolStat(pool.memory, total.memory, formatBytes)} />
+            <StatCard icon={faHdd} label='Disk available' {...poolStat(pool.disk, total.disk, formatBytes)} />
             <StatCard
               icon={faServer}
               label='Splits'
@@ -414,6 +470,7 @@ export default function ServerSplitterPage() {
             label='Server Name'
             placeholder='e.g. Lobby Proxy'
             required
+            maxLength={255}
             value={createName}
             onChange={(e) => setCreateName(e.currentTarget.value)}
           />
@@ -421,6 +478,7 @@ export default function ServerSplitterPage() {
           <TextInput
             label='Description'
             placeholder='Optional description'
+            maxLength={1024}
             value={createDescription}
             onChange={(e) => setCreateDescription(e.currentTarget.value)}
           />
@@ -445,73 +503,80 @@ export default function ServerSplitterPage() {
             Resource Allocation
           </Title>
 
-          <SimpleGrid cols={{ base: 1, sm: 3 }} spacing='md'>
-            <NumberInput
-              label='CPU Limit (%)'
-              required
-              min={1}
-              max={remaining?.cpu ?? 100}
-              value={createCpu}
-              onChange={(val) => setCreateCpu(typeof val === 'number' ? val : 0)}
-              description={`Available: ${remaining?.cpu ?? 0}%`}
-            />
+          {createBounds && remaining && (
+            <>
+              <SimpleGrid cols={{ base: 1, sm: 3 }} spacing='md'>
+                <NumberInput
+                  label='CPU Limit (%)'
+                  required
+                  min={createBounds.cpu.min}
+                  max={createBounds.cpu.max}
+                  value={createCpu}
+                  onChange={(val) => setCreateCpu(typeof val === 'number' ? val : createBounds.cpu.min)}
+                  description={boundsText('Available', createBounds.cpu, formatPercent)}
+                />
 
-            <NumberInput
-              label='Memory (MB)'
-              required
-              min={256}
-              max={remaining?.memory ?? 1024}
-              value={createMemory}
-              onChange={(val) => setCreateMemory(typeof val === 'number' ? val : 0)}
-              description={`Available: ${formatBytes(remaining?.memory ?? 0)}`}
-            />
+                <NumberInput
+                  label='Memory (MB)'
+                  required
+                  min={createBounds.memory.min}
+                  max={createBounds.memory.max}
+                  value={createMemory}
+                  onChange={(val) => setCreateMemory(typeof val === 'number' ? val : createBounds.memory.min)}
+                  description={boundsText('Available', createBounds.memory, formatBytes)}
+                />
 
-            <NumberInput
-              label='Disk (MB)'
-              required
-              min={512}
-              max={remaining?.disk ?? 2048}
-              value={createDisk}
-              onChange={(val) => setCreateDisk(typeof val === 'number' ? val : 0)}
-              description={`Available: ${formatBytes(remaining?.disk ?? 0)}`}
-            />
-          </SimpleGrid>
+                <NumberInput
+                  label='Disk (MB)'
+                  required
+                  min={createBounds.disk.min}
+                  max={createBounds.disk.max}
+                  value={createDisk}
+                  onChange={(val) => setCreateDisk(typeof val === 'number' ? val : createBounds.disk.min)}
+                  description={boundsText('Available', createBounds.disk, formatBytes)}
+                />
+              </SimpleGrid>
 
-          <Title order={5} mt='xs'>
-            Feature Limits
-          </Title>
+              <Title order={5} mt='xs'>
+                Feature Limits
+              </Title>
 
-          <SimpleGrid cols={{ base: 2, sm: 4 }} spacing='md'>
-            <NumberInput
-              label='Allocations'
-              min={1}
-              max={remaining?.feature_limits?.allocations ?? 1}
-              value={createAllocations}
-              onChange={(val) => setCreateAllocations(typeof val === 'number' ? val : 1)}
-              description={remaining ? `Available: ${remaining.feature_limits.allocations}` : undefined}
-            />
-            <NumberInput
-              label='Databases'
-              min={0}
-              value={createDatabases}
-              onChange={(val) => setCreateDatabases(typeof val === 'number' ? val : 0)}
-              description={remaining ? `Available: ${remaining.feature_limits.databases}` : undefined}
-            />
-            <NumberInput
-              label='Backups'
-              min={0}
-              value={createBackups}
-              onChange={(val) => setCreateBackups(typeof val === 'number' ? val : 0)}
-              description={remaining ? `Available: ${remaining.feature_limits.backups}` : undefined}
-            />
-            <NumberInput
-              label='Schedules'
-              min={0}
-              value={createSchedules}
-              onChange={(val) => setCreateSchedules(typeof val === 'number' ? val : 0)}
-              description={remaining ? `Available: ${remaining.feature_limits.schedules}` : undefined}
-            />
-          </SimpleGrid>
+              <SimpleGrid cols={{ base: 2, sm: 4 }} spacing='md'>
+                <NumberInput
+                  label='Allocations'
+                  min={1}
+                  max={remaining.feature_limits.allocations}
+                  value={createAllocations}
+                  onChange={(val) => setCreateAllocations(typeof val === 'number' ? val : 1)}
+                  description={`Available: ${remaining.feature_limits.allocations}`}
+                />
+                <NumberInput
+                  label='Databases'
+                  min={0}
+                  max={remaining.feature_limits.databases}
+                  value={createDatabases}
+                  onChange={(val) => setCreateDatabases(typeof val === 'number' ? val : 0)}
+                  description={`Available: ${remaining.feature_limits.databases}`}
+                />
+                <NumberInput
+                  label='Backups'
+                  min={0}
+                  max={remaining.feature_limits.backups}
+                  value={createBackups}
+                  onChange={(val) => setCreateBackups(typeof val === 'number' ? val : 0)}
+                  description={`Available: ${remaining.feature_limits.backups}`}
+                />
+                <NumberInput
+                  label='Schedules'
+                  min={0}
+                  max={remaining.feature_limits.schedules}
+                  value={createSchedules}
+                  onChange={(val) => setCreateSchedules(typeof val === 'number' ? val : 0)}
+                  description={`Available: ${remaining.feature_limits.schedules}`}
+                />
+              </SimpleGrid>
+            </>
+          )}
 
           <Switch
             label='Sync subusers and permissions to child server'
@@ -539,115 +604,98 @@ export default function ServerSplitterPage() {
         size='lg'
       >
         <Stack gap='md'>
-          <TextInput label='Server Name' value={editName} onChange={(e) => setEditName(e.currentTarget.value)} />
+          <TextInput
+            label='Server Name'
+            maxLength={255}
+            value={editName}
+            onChange={(e) => setEditName(e.currentTarget.value)}
+          />
 
           <TextInput
             label='Description'
+            maxLength={1024}
             value={editDescription}
             onChange={(e) => setEditDescription(e.currentTarget.value)}
           />
 
-          <Title order={5} mt='xs'>
-            Resource Limits
-          </Title>
+          {editBounds && (
+            <>
+              <Title order={5} mt='xs'>
+                Resource Limits
+              </Title>
 
-          <SimpleGrid cols={{ base: 1, sm: 3 }} spacing='md'>
-            <NumberInput
-              label='CPU (%)'
-              required
-              min={1}
-              max={editingSubserver && remaining ? editingSubserver.limits.cpu + remaining.cpu : 100}
-              value={editCpu}
-              onChange={(val) => setEditCpu(typeof val === 'number' ? val : 0)}
-              description={
-                editingSubserver && remaining ? `Max: ${editingSubserver.limits.cpu + remaining.cpu}%` : undefined
-              }
-            />
+              <SimpleGrid cols={{ base: 1, sm: 3 }} spacing='md'>
+                <NumberInput
+                  label='CPU (%)'
+                  required
+                  min={editBounds.cpu.min}
+                  max={editBounds.cpu.max}
+                  value={editCpu}
+                  onChange={(val) => setEditCpu(typeof val === 'number' ? val : editBounds.cpu.min)}
+                  description={boundsText('Max', editBounds.cpu, formatPercent)}
+                />
 
-            <NumberInput
-              label='Memory (MB)'
-              required
-              min={256}
-              max={editingSubserver && remaining ? editingSubserver.limits.memory + remaining.memory : 1024}
-              value={editMemory}
-              onChange={(val) => setEditMemory(typeof val === 'number' ? val : 0)}
-              description={
-                editingSubserver && remaining
-                  ? `Max: ${formatBytes(editingSubserver.limits.memory + remaining.memory)}`
-                  : undefined
-              }
-            />
+                <NumberInput
+                  label='Memory (MB)'
+                  required
+                  min={editBounds.memory.min}
+                  max={editBounds.memory.max}
+                  value={editMemory}
+                  onChange={(val) => setEditMemory(typeof val === 'number' ? val : editBounds.memory.min)}
+                  description={boundsText('Max', editBounds.memory, formatBytes)}
+                />
 
-            <NumberInput
-              label='Disk (MB)'
-              required
-              min={512}
-              max={editingSubserver && remaining ? editingSubserver.limits.disk + remaining.disk : 2048}
-              value={editDisk}
-              onChange={(val) => setEditDisk(typeof val === 'number' ? val : 0)}
-              description={
-                editingSubserver && remaining
-                  ? `Max: ${formatBytes(editingSubserver.limits.disk + remaining.disk)}`
-                  : undefined
-              }
-            />
-          </SimpleGrid>
+                <NumberInput
+                  label='Disk (MB)'
+                  required
+                  min={editBounds.disk.min}
+                  max={editBounds.disk.max}
+                  value={editDisk}
+                  onChange={(val) => setEditDisk(typeof val === 'number' ? val : editBounds.disk.min)}
+                  description={boundsText('Max', editBounds.disk, formatBytes)}
+                />
+              </SimpleGrid>
 
-          <Title order={5} mt='xs'>
-            Feature Limits
-          </Title>
+              <Title order={5} mt='xs'>
+                Feature Limits
+              </Title>
 
-          <SimpleGrid cols={{ base: 2, sm: 4 }} spacing='md'>
-            <NumberInput
-              label='Allocations'
-              min={1}
-              max={
-                editingSubserver && remaining
-                  ? editingSubserver.featureLimits.allocations + remaining.feature_limits.allocations
-                  : 1
-              }
-              value={editAllocations}
-              onChange={(val) => setEditAllocations(typeof val === 'number' ? val : 1)}
-              description={
-                editingSubserver && remaining
-                  ? `Max: ${editingSubserver.featureLimits.allocations + remaining.feature_limits.allocations}`
-                  : undefined
-              }
-            />
-            <NumberInput
-              label='Databases'
-              min={0}
-              value={editDatabases}
-              onChange={(val) => setEditDatabases(typeof val === 'number' ? val : 0)}
-              description={
-                editingSubserver && remaining
-                  ? `Max: ${editingSubserver.featureLimits.databases + remaining.feature_limits.databases}`
-                  : undefined
-              }
-            />
-            <NumberInput
-              label='Backups'
-              min={0}
-              value={editBackups}
-              onChange={(val) => setEditBackups(typeof val === 'number' ? val : 0)}
-              description={
-                editingSubserver && remaining
-                  ? `Max: ${editingSubserver.featureLimits.backups + remaining.feature_limits.backups}`
-                  : undefined
-              }
-            />
-            <NumberInput
-              label='Schedules'
-              min={0}
-              value={editSchedules}
-              onChange={(val) => setEditSchedules(typeof val === 'number' ? val : 0)}
-              description={
-                editingSubserver && remaining
-                  ? `Max: ${editingSubserver.featureLimits.schedules + remaining.feature_limits.schedules}`
-                  : undefined
-              }
-            />
-          </SimpleGrid>
+              <SimpleGrid cols={{ base: 2, sm: 4 }} spacing='md'>
+                <NumberInput
+                  label='Allocations'
+                  min={1}
+                  max={editBounds.allocations}
+                  value={editAllocations}
+                  onChange={(val) => setEditAllocations(typeof val === 'number' ? val : 1)}
+                  description={`Max: ${editBounds.allocations}`}
+                />
+                <NumberInput
+                  label='Databases'
+                  min={0}
+                  max={editBounds.databases}
+                  value={editDatabases}
+                  onChange={(val) => setEditDatabases(typeof val === 'number' ? val : 0)}
+                  description={`Max: ${editBounds.databases}`}
+                />
+                <NumberInput
+                  label='Backups'
+                  min={0}
+                  max={editBounds.backups}
+                  value={editBackups}
+                  onChange={(val) => setEditBackups(typeof val === 'number' ? val : 0)}
+                  description={`Max: ${editBounds.backups}`}
+                />
+                <NumberInput
+                  label='Schedules'
+                  min={0}
+                  max={editBounds.schedules}
+                  value={editSchedules}
+                  onChange={(val) => setEditSchedules(typeof val === 'number' ? val : 0)}
+                  description={`Max: ${editBounds.schedules}`}
+                />
+              </SimpleGrid>
+            </>
+          )}
 
           <ModalFooter>
             <Button variant='default' onClick={() => setIsEditOpen(false)}>

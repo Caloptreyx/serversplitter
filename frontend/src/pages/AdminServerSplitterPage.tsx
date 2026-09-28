@@ -18,10 +18,12 @@ import {
 } from '@mantine/core';
 import { useEffect, useMemo, useState } from 'react';
 import { httpErrorToHuman } from '@/api/axios.ts';
+import AlertError from '@/elements/alerts/AlertError.tsx';
 import Button from '@/elements/buttons/Button.tsx';
 import Spinner from '@/elements/feedback/Spinner.tsx';
 import ConfirmationModal from '@/elements/modals/ConfirmationModal.tsx';
 import { Modal, ModalFooter } from '@/elements/modals/Modal.tsx';
+import { useAdminCan } from '@/plugins/usePermissions.ts';
 import { useToast } from '@/providers/ToastProvider.tsx';
 import {
   type AdminSettingsResponse,
@@ -36,10 +38,12 @@ import EggTreePicker from '../components/EggTreePicker.tsx';
 
 export default function AdminServerSplitterPage() {
   const { addToast } = useToast();
+  const canWrite = useAdminCan('extensions.splitter.write');
 
   const [loading, setLoading] = useState(true);
   const [savingSettings, setSavingSettings] = useState(false);
   const [settings, setSettings] = useState<AdminSettingsResponse | null>(null);
+  const [loadError, setLoadError] = useState('');
 
   // General Settings Form
   const [reservedCpu, setReservedCpu] = useState<number>(0);
@@ -62,6 +66,7 @@ export default function AdminServerSplitterPage() {
   const loadSettings = async () => {
     try {
       setLoading(true);
+      setLoadError('');
       const data = await getAdminSplitterSettings();
       setSettings(data);
       setReservedCpu(data.reserved_cpu);
@@ -71,6 +76,7 @@ export default function AdminServerSplitterPage() {
       setDisplayReservedLimits(data.display_reserved_limits);
       setDefaultSplits(data.default_splits);
     } catch (err) {
+      setLoadError(httpErrorToHuman(err));
       addToast(httpErrorToHuman(err), 'error');
     } finally {
       setLoading(false);
@@ -171,6 +177,29 @@ export default function AdminServerSplitterPage() {
     }
   };
 
+  const header = (
+    <Group justify='space-between' align='center'>
+      <div>
+        <Title order={3} fw={700}>
+          Server Splitter Configuration
+        </Title>
+        <Text size='sm' c='dimmed'>
+          Configure master resource reservations and egg permission rules.
+        </Text>
+      </div>
+      <MantineButton
+        component='a'
+        href='https://discord.gg/4qjMWU7S8x'
+        target='_blank'
+        rel='noopener noreferrer'
+        variant='default'
+        leftSection={<FontAwesomeIcon icon={faDiscord} />}
+      >
+        Support & feature requests
+      </MantineButton>
+    </Group>
+  );
+
   if (loading && !settings) {
     return (
       <div className='flex justify-center items-center py-24'>
@@ -179,28 +208,22 @@ export default function AdminServerSplitterPage() {
     );
   }
 
+  if (!settings) {
+    // Never render the editable form with placeholder values: saving it would overwrite real settings.
+    return (
+      <Stack gap='lg'>
+        {header}
+        {loadError && <AlertError error={loadError} setError={setLoadError} />}
+        <Group>
+          <Button onClick={loadSettings}>Retry</Button>
+        </Group>
+      </Stack>
+    );
+  }
+
   return (
     <Stack gap='lg'>
-      <Group justify='space-between' align='center'>
-        <div>
-          <Title order={3} fw={700}>
-            Server Splitter Configuration
-          </Title>
-          <Text size='sm' c='dimmed'>
-            Configure master resource reservations and egg permission rules.
-          </Text>
-        </div>
-        <MantineButton
-          component='a'
-          href='https://discord.gg/4qjMWU7S8x'
-          target='_blank'
-          rel='noopener noreferrer'
-          variant='default'
-          leftSection={<FontAwesomeIcon icon={faDiscord} />}
-        >
-          Support & feature requests
-        </MantineButton>
-      </Group>
+      {header}
 
       <Tabs defaultValue='general'>
         <Tabs.List mb='md'>
@@ -234,6 +257,7 @@ export default function AdminServerSplitterPage() {
 
               <SimpleGrid cols={{ base: 1, sm: 3 }} spacing='md'>
                 <NumberInput
+                  disabled={!canWrite}
                   label='Reserved CPU (%)'
                   description='Minimum CPU % kept by parent'
                   min={0}
@@ -241,6 +265,7 @@ export default function AdminServerSplitterPage() {
                   onChange={(val) => setReservedCpu(typeof val === 'number' ? val : 0)}
                 />
                 <NumberInput
+                  disabled={!canWrite}
                   label='Reserved Memory (MB)'
                   description='Minimum RAM (MB) kept by parent'
                   min={0}
@@ -248,6 +273,7 @@ export default function AdminServerSplitterPage() {
                   onChange={(val) => setReservedMemory(typeof val === 'number' ? val : 0)}
                 />
                 <NumberInput
+                  disabled={!canWrite}
                   label='Reserved Disk (MB)'
                   description='Minimum Disk (MB) kept by parent'
                   min={0}
@@ -263,6 +289,7 @@ export default function AdminServerSplitterPage() {
               </Title>
 
               <NumberInput
+                disabled={!canWrite}
                 label='Default Split Limit'
                 description='Split limit applied to new servers unless overridden.'
                 min={0}
@@ -278,6 +305,7 @@ export default function AdminServerSplitterPage() {
               </Title>
 
               <Switch
+                disabled={!canWrite}
                 label='Include master server live disk usage'
                 description='Factor in current disk storage consumed when calculating remaining disk pool'
                 checked={includeDiskUsage}
@@ -285,22 +313,25 @@ export default function AdminServerSplitterPage() {
               />
 
               <Switch
+                disabled={!canWrite}
                 label='Display reserved limits on client interface'
                 description='Show reserved values to users on the client splitter page'
                 checked={displayReservedLimits}
                 onChange={(e) => setDisplayReservedLimits(e.currentTarget.checked)}
               />
 
-              <Group justify='flex-end' mt='md'>
-                <Button
-                  color='blue'
-                  loading={savingSettings}
-                  onClick={handleSaveSettings}
-                  leftSection={<FontAwesomeIcon icon={faSave} />}
-                >
-                  Save Settings
-                </Button>
-              </Group>
+              {canWrite && (
+                <Group justify='flex-end' mt='md'>
+                  <Button
+                    color='blue'
+                    loading={savingSettings}
+                    onClick={handleSaveSettings}
+                    leftSection={<FontAwesomeIcon icon={faSave} />}
+                  >
+                    Save Settings
+                  </Button>
+                </Group>
+              )}
             </Stack>
           </Card>
         </Tabs.Panel>
@@ -319,20 +350,22 @@ export default function AdminServerSplitterPage() {
                     a server egg, splitting will not allow creating child servers.
                   </Text>
                 </div>
-                <Button
-                  color='blue'
-                  size='sm'
-                  onClick={handleOpenCreateRule}
-                  leftSection={<FontAwesomeIcon icon={faPlus} />}
-                >
-                  Add Egg Rule
-                </Button>
+                {canWrite && (
+                  <Button
+                    color='blue'
+                    size='sm'
+                    onClick={handleOpenCreateRule}
+                    leftSection={<FontAwesomeIcon icon={faPlus} />}
+                  >
+                    Add Egg Rule
+                  </Button>
+                )}
               </Group>
 
               {settings?.egg_rules.length === 0 ? (
                 <div className='py-8 text-center'>
                   <Text c='dimmed' size='sm'>
-                    No egg rules defined yet. Click "Add Egg Rule" to permit child egg creation.
+                    No egg rules defined yet.{canWrite && ' Click "Add Egg Rule" to permit child egg creation.'}
                   </Text>
                 </div>
               ) : (
@@ -342,7 +375,7 @@ export default function AdminServerSplitterPage() {
                       <Table.Tr>
                         <Table.Th>Master Eggs</Table.Th>
                         <Table.Th>Allowed Child Eggs</Table.Th>
-                        <Table.Th style={{ width: 120 }}>Actions</Table.Th>
+                        {canWrite && <Table.Th style={{ width: 120 }}>Actions</Table.Th>}
                       </Table.Tr>
                     </Table.Thead>
                     <Table.Tbody>
@@ -372,16 +405,18 @@ export default function AdminServerSplitterPage() {
                               })}
                             </Group>
                           </Table.Td>
-                          <Table.Td>
-                            <Group gap='xs'>
-                              <Button size='xs' variant='light' color='gray' onClick={() => handleOpenEditRule(rule)}>
-                                <FontAwesomeIcon icon={faEdit} />
-                              </Button>
-                              <Button size='xs' variant='subtle' color='red' onClick={() => setRuleToDelete(rule)}>
-                                <FontAwesomeIcon icon={faTrash} />
-                              </Button>
-                            </Group>
-                          </Table.Td>
+                          {canWrite && (
+                            <Table.Td>
+                              <Group gap='xs'>
+                                <Button size='xs' variant='light' color='gray' onClick={() => handleOpenEditRule(rule)}>
+                                  <FontAwesomeIcon icon={faEdit} />
+                                </Button>
+                                <Button size='xs' variant='subtle' color='red' onClick={() => setRuleToDelete(rule)}>
+                                  <FontAwesomeIcon icon={faTrash} />
+                                </Button>
+                              </Group>
+                            </Table.Td>
+                          )}
                         </Table.Tr>
                       ))}
                     </Table.Tbody>

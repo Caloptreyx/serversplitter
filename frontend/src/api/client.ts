@@ -56,6 +56,10 @@ export interface SplitterFeatureLimits {
   splits: number;
 }
 
+/**
+ * In `remaining`, `cpu`/`memory`/`disk` of `-1` mean the master is unlimited for that resource.
+ * In `total`, `0` means unlimited.
+ */
 export interface SplitterResourceLimits {
   cpu: number;
   memory: number;
@@ -71,9 +75,13 @@ export interface ReservedLimits {
 
 export interface ResourcesData {
   total: SplitterResourceLimits;
+  /** Exact maximums the backend accepts for a new split (`-1` = unlimited). */
   remaining: SplitterResourceLimits;
+  /** Display-only numbers for the pool stat cards; never use for form bounds. */
   remaining_display: SplitterResourceLimits;
   reserved: ReservedLimits;
+  /** When true, one allocation of `remaining.feature_limits.allocations` is not available to resizes. */
+  transferable_allocation: boolean;
 }
 
 export interface NestEggItem {
