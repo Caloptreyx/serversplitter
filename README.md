@@ -4,7 +4,7 @@ A [Calagopus Panel](https://calagopus.com) extension that lets users split a mas
 resources into separate child servers, each with its own console, files, egg and allocation.
 Deleting a split gives its resources back to the master.
 
-Package name: `com.caloptreyx.serversplitter` · Requires panel `>=1.2.3`
+Package name: `com.caloptreyx.serversplitter` · Requires panel `>=1.2.6`
 
 ![Splitter page](docs/screenshots/splitter.png)
 

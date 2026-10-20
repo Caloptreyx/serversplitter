@@ -16,8 +16,8 @@ use shared::{
         nest_egg_variable::NestEggVariable,
         node_allocation::NodeAllocation,
         server::{
-            AdminApiServerLimits, ApiServer, ApiServerFeatureLimits, CreateServerOptions,
-            DeleteServerOptions, GetServer, GetServerActivityLogger, Server,
+            AdminApiServerLimits, ApiServer, ApiServerBandwidth, ApiServerFeatureLimits,
+            CreateServerOptions, DeleteServerOptions, GetServer, GetServerActivityLogger, Server,
         },
         server_subuser::{CreateServerSubuserOptions, ServerSubuser},
         user::{GetPermissionManager, GetUser},
@@ -681,6 +681,11 @@ mod post_split {
                 },
                 disk: data.disk,
                 io_weight: master.io_weight,
+                // a rate cap, not a pooled resource: the split gets the master's limits
+                bandwidth: Some(ApiServerBandwidth {
+                    upload: master.bandwidth_upload as u64,
+                    download: master.bandwidth_download as u64,
+                }),
             },
             pinned_cpus: Vec::new(),
             startup,
@@ -688,6 +693,7 @@ mod post_split {
             // container labels are admin set per server (1.2.3); a split starts without the master's
             labels: Default::default(),
             timezone,
+            trash: master.trash,
             hugepages_passthrough_enabled: master.hugepages_passthrough_enabled,
             kvm_passthrough_enabled: master.kvm_passthrough_enabled,
             feature_limits: ApiServerFeatureLimits {

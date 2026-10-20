@@ -383,13 +383,11 @@ pub async fn credit_master(
 
 /// Invalidates the cached copies of `uuids` and pushes their current limits to Wings.
 pub async fn refresh_and_sync(state: &State, uuids: &[uuid::Uuid]) {
-    let database = std::sync::Arc::new(state.database.clone());
-
     for &uuid in uuids {
         Server::invalidate_cached(&state.database, uuid).await;
 
         match Server::by_uuid_optional(&state.database, uuid).await {
-            Ok(Some(server)) => server.batch_sync(&database).await,
+            Ok(Some(server)) => server.batch_sync(state).await,
             Ok(None) => {}
             Err(err) => tracing::warn!(server = %uuid, "failed to reload server for sync: {err:?}"),
         }
