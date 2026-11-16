@@ -2,12 +2,12 @@ import { faNetworkWired } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { Text } from '@mantine/core';
 import { type ReactNode, useEffect, useState } from 'react';
+import type { AdminServer } from '@/lib/schemas/admin/servers.ts';
 import Badge from '@/elements/data-display/Badge.tsx';
 import TableLink from '@/elements/data-display/TableLink.tsx';
 import TitleCard from '@/elements/data-display/TitleCard.tsx';
 import Spinner from '@/elements/feedback/Spinner.tsx';
 import { bytesToString, mbToBytes } from '@/lib/format/size.ts';
-import type { AdminServer } from '@/lib/schemas/admin/servers.ts';
 import { type AdminServerSplits, getAdminServerSplits } from '../api/client.ts';
 
 // Same row markup as the admin server Overview cards.

@@ -1,3 +1,4 @@
+import type { MouseEvent, ReactNode } from 'react';
 import {
   faBan,
   faEllipsisVertical,
@@ -9,7 +10,6 @@ import {
   faUsers,
 } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import type { MouseEvent, ReactNode } from 'react';
 import { NavLink } from 'react-router';
 import ActionIcon from '@/elements/buttons/ActionIcon.tsx';
 import CopyOnClick from '@/elements/CopyOnClick.tsx';

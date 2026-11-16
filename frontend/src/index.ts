@@ -1,5 +1,5 @@
-import { faNetworkWired } from '@fortawesome/free-solid-svg-icons';
 import type { FC } from 'react';
+import { faNetworkWired } from '@fortawesome/free-solid-svg-icons';
 import { Extension, ExtensionContext } from 'shared';
 import { z } from 'zod';
 import { type FieldDef, insertFieldsAfter } from '@/elements/form-engine/index.ts';
