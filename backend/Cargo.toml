@@ -25,3 +25,4 @@ tokio = { workspace = true }
 indexmap = { workspace = true }
 chrono-tz = { workspace = true }
 schema-extension-core = { workspace = true }
+rule-validator = { workspace = true }

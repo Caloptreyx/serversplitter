@@ -3,7 +3,7 @@ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { ActionIcon, Checkbox, Group, Input, Paper, ScrollArea, Stack, Text, TextInput } from '@mantine/core';
 import { type ReactNode, useMemo, useState } from 'react';
 import Button from '@/elements/buttons/Button.tsx';
-import type { EggItem } from '../api/client.ts';
+import type { EggItem } from '../api/admin.ts';
 
 interface NestGroup {
   uuid: string;

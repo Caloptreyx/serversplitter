@@ -1,5 +1,5 @@
-//! A master server's resource pool: what its splits may take, and the locked debits and credits
-//! that move resources between the master and its splits.
+//! A master server's resource pool: what its splits may take, the ledger of what each split was granted,
+//! and the locked debits and credits that move resources between the master and its splits.
 //!
 //! Every change to a master's pool first locks the master row (`FOR NO KEY UPDATE`) and re-reads
 //! it inside that transaction. The lock serializes concurrent split operations on one master,
@@ -7,20 +7,21 @@
 //! `FOR NO KEY UPDATE` still lets other transactions insert rows referencing the master, which
 //! [`Server::create`] does while a split is being created under the lock.
 
-use crate::settings::ServerSplitterSettingsData;
+use crate::settings::{ServerSplitterSettingsData, SwapMode};
 use shared::{
     State,
     database::DatabaseError,
-    models::{ByUuid, server::Server},
+    models::{ByUuid, server::Server, server_backup::ServerBackup},
 };
 use sqlx::{PgConnection, Postgres, Row, Transaction};
 
-/// cpu (%), memory and disk (MB), and feature limits. For cpu/memory/disk 0 means unlimited on a
-/// server, and -1 means unlimited in a pool computed by [`remaining`].
+/// cpu (%), memory, swap and disk (MB), and feature limits. For cpu/memory/disk 0 means unlimited on a
+/// server, and -1 means unlimited in a pool computed by [`remaining`]. Swap is -1 for unlimited, 0 for none.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Limits {
     pub cpu: i32,
     pub memory: i64,
+    pub swap: i64,
     pub disk: i64,
     pub allocations: i32,
     pub databases: i32,
@@ -33,6 +34,7 @@ impl Limits {
         Self {
             cpu: server.cpu,
             memory: server.memory,
+            swap: server.swap,
             disk: server.disk,
             allocations: server.allocation_limit,
             databases: server.database_limit,
@@ -46,11 +48,259 @@ impl Limits {
         Self {
             cpu: self.cpu - other.cpu,
             memory: self.memory - other.memory,
+            swap: self.swap - other.swap,
             disk: self.disk - other.disk,
             allocations: self.allocations - other.allocations,
             databases: self.databases - other.databases,
             backups: self.backups - other.backups,
             schedules: self.schedules - other.schedules,
+        }
+    }
+
+    pub fn plus(&self, other: &Self) -> Self {
+        Self {
+            cpu: self.cpu + other.cpu,
+            memory: self.memory + other.memory,
+            swap: self.swap + other.swap,
+            disk: self.disk + other.disk,
+            allocations: self.allocations + other.allocations,
+            databases: self.databases + other.databases,
+            backups: self.backups + other.backups,
+            schedules: self.schedules + other.schedules,
+        }
+    }
+
+    /// Fields that differ, as `name: self -> other`.
+    pub fn differences(&self, other: &Self) -> Vec<String> {
+        let fields: [(&str, i64, i64); 8] = [
+            ("cpu", self.cpu as i64, other.cpu as i64),
+            ("memory", self.memory, other.memory),
+            ("swap", self.swap, other.swap),
+            ("disk", self.disk, other.disk),
+            ("allocations", self.allocations as i64, other.allocations as i64),
+            ("databases", self.databases as i64, other.databases as i64),
+            ("backups", self.backups as i64, other.backups as i64),
+            ("schedules", self.schedules as i64, other.schedules as i64),
+        ];
+
+        fields
+            .into_iter()
+            .filter(|(_, a, b)| a != b)
+            .map(|(name, a, b)| format!("{name}: {a} -> {b}"))
+            .collect()
+    }
+}
+
+/// What of a split's cpu/memory/swap/disk was taken from its master's limits. Feature limits are
+/// always taken in full.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Charged {
+    pub cpu: i32,
+    pub memory: i64,
+    pub swap: i64,
+    pub disk: i64,
+}
+
+/// One split in the ledger: what it was granted and what of that its master was charged.
+#[derive(Clone, Copy, Debug)]
+pub struct LedgerEntry {
+    pub split_uuid: uuid::Uuid,
+    pub master_uuid: uuid::Uuid,
+    pub granted: Limits,
+    pub charged: Charged,
+    pub port_from_master: bool,
+}
+
+impl LedgerEntry {
+    /// What deleting the split gives back to its master, as a (negative) debit.
+    pub fn refund(&self) -> Limits {
+        Limits {
+            cpu: -self.charged.cpu,
+            memory: -self.charged.memory,
+            swap: -self.charged.swap,
+            disk: -self.charged.disk,
+            allocations: -self.granted.allocations,
+            databases: -self.granted.databases,
+            backups: -self.granted.backups,
+            schedules: -self.granted.schedules,
+        }
+    }
+}
+
+fn map_ledger(row: &sqlx::postgres::PgRow) -> LedgerEntry {
+    LedgerEntry {
+        split_uuid: row.get("split_uuid"),
+        master_uuid: row.get("master_uuid"),
+        granted: Limits {
+            cpu: row.get("cpu"),
+            memory: row.get("memory"),
+            swap: row.get("swap"),
+            disk: row.get("disk"),
+            allocations: row.get("allocations"),
+            databases: row.get("databases"),
+            backups: row.get("backups"),
+            schedules: row.get("schedules"),
+        },
+        charged: Charged {
+            cpu: row.get("charged_cpu"),
+            memory: row.get("charged_memory"),
+            swap: row.get("charged_swap"),
+            disk: row.get("charged_disk"),
+        },
+        port_from_master: row.get("port_from_master"),
+    }
+}
+
+const LEDGER_COLUMNS: &str = "split_uuid, master_uuid, cpu, memory, swap, disk, allocations, databases, backups, schedules, charged_cpu, charged_memory, charged_swap, charged_disk, port_from_master";
+
+pub async fn ledger_entry(
+    conn: &mut PgConnection,
+    split_uuid: uuid::Uuid,
+) -> Result<Option<LedgerEntry>, sqlx::Error> {
+    let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {LEDGER_COLUMNS} FROM serversplitter_splits WHERE split_uuid = $1"
+    )))
+    .bind(split_uuid)
+    .fetch_optional(conn)
+    .await?;
+
+    Ok(row.as_ref().map(map_ledger))
+}
+
+pub async fn ledger_by_master(
+    conn: &mut PgConnection,
+    master_uuid: uuid::Uuid,
+) -> Result<Vec<LedgerEntry>, sqlx::Error> {
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT {LEDGER_COLUMNS} FROM serversplitter_splits WHERE master_uuid = $1 ORDER BY created ASC"
+    )))
+    .bind(master_uuid)
+    .fetch_all(conn)
+    .await?;
+
+    Ok(rows.iter().map(map_ledger).collect())
+}
+
+/// Inserts or replaces a split's ledger entry.
+pub async fn save_ledger(conn: &mut PgConnection, entry: &LedgerEntry) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO serversplitter_splits (
+            split_uuid, master_uuid, cpu, memory, swap, disk, allocations, databases, backups, schedules,
+            charged_cpu, charged_memory, charged_swap, charged_disk, port_from_master
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        ON CONFLICT (split_uuid) DO UPDATE SET
+            master_uuid = EXCLUDED.master_uuid,
+            cpu = EXCLUDED.cpu,
+            memory = EXCLUDED.memory,
+            swap = EXCLUDED.swap,
+            disk = EXCLUDED.disk,
+            allocations = EXCLUDED.allocations,
+            databases = EXCLUDED.databases,
+            backups = EXCLUDED.backups,
+            schedules = EXCLUDED.schedules,
+            charged_cpu = EXCLUDED.charged_cpu,
+            charged_memory = EXCLUDED.charged_memory,
+            charged_swap = EXCLUDED.charged_swap,
+            charged_disk = EXCLUDED.charged_disk,
+            port_from_master = EXCLUDED.port_from_master,
+            updated = NOW()
+        "#,
+    )
+    .bind(entry.split_uuid)
+    .bind(entry.master_uuid)
+    .bind(entry.granted.cpu)
+    .bind(entry.granted.memory)
+    .bind(entry.granted.swap)
+    .bind(entry.granted.disk)
+    .bind(entry.granted.allocations)
+    .bind(entry.granted.databases)
+    .bind(entry.granted.backups)
+    .bind(entry.granted.schedules)
+    .bind(entry.charged.cpu)
+    .bind(entry.charged.memory)
+    .bind(entry.charged.swap)
+    .bind(entry.charged.disk)
+    .bind(entry.port_from_master)
+    .execute(conn)
+    .await?;
+
+    Ok(())
+}
+
+/// What to debit from one master resource when a split's grant changes by `delta`, given the split
+/// was charged `charged` for it so far. Returns `(debit, new_charged)`; a negative debit gives back.
+/// A master that isn't limited for the resource is never charged, and a shrink gives back at most what
+/// was charged, so the pool can't grow out of nothing.
+pub fn charge(master_limited: bool, charged: i64, delta: i64) -> (i64, i64) {
+    if delta >= 0 {
+        if master_limited {
+            (delta, charged + delta)
+        } else {
+            (0, charged)
+        }
+    } else {
+        let back = (-delta).min(charged.max(0));
+        (-back, charged - back)
+    }
+}
+
+/// Moves a split from `old` to `new` granted limits against `master` (its locked, fresh limits).
+/// Returns the debit to apply to the master and the split's new charged amounts.
+pub fn regrant(
+    master: &Limits,
+    swap_pooled: bool,
+    old: &Limits,
+    charged: &Charged,
+    new: &Limits,
+) -> (Limits, Charged) {
+    let (cpu, charged_cpu) = charge(
+        master.cpu > 0,
+        charged.cpu as i64,
+        (new.cpu - old.cpu) as i64,
+    );
+    let (memory, charged_memory) = charge(master.memory > 0, charged.memory, new.memory - old.memory);
+    let (swap, charged_swap) = charge(
+        swap_pooled && master.swap >= 0,
+        charged.swap,
+        new.swap - old.swap,
+    );
+    let (disk, charged_disk) = charge(master.disk > 0, charged.disk, new.disk - old.disk);
+
+    (
+        Limits {
+            cpu: cpu as i32,
+            memory,
+            swap,
+            disk,
+            allocations: new.allocations - old.allocations,
+            databases: new.databases - old.databases,
+            backups: new.backups - old.backups,
+            schedules: new.schedules - old.schedules,
+        },
+        Charged {
+            cpu: charged_cpu as i32,
+            memory: charged_memory,
+            swap: charged_swap,
+            disk: charged_disk,
+        },
+    )
+}
+
+/// The swap a split with `memory` gets. `held` is the swap it already holds of its master's (it goes
+/// back into the pool on a resize).
+pub fn split_swap(mode: SwapMode, master_swap: i64, memory: i64, held: i64) -> i64 {
+    match mode {
+        SwapMode::None => 0,
+        SwapMode::Copy => master_swap,
+        SwapMode::Pooled => {
+            let wanted = memory.max(0) / 4;
+            if master_swap < 0 {
+                wanted
+            } else {
+                wanted.min(master_swap + held.max(0))
+            }
         }
     }
 }
@@ -81,11 +331,13 @@ pub async fn feature_usage(
                 WHERE server_uuid = $1
                     AND system_backup_policy_uuid IS NULL
                     AND deleted IS NULL
+                    AND (deleting IS NULL OR deletion_retries >= $2)
             ) AS backups,
             (SELECT count(*) FROM server_schedules WHERE server_uuid = $1) AS schedules
         "#,
     )
     .bind(server_uuid)
+    .bind(ServerBackup::MAX_DELETION_RETRIES)
     .fetch_one(conn)
     .await?;
 
@@ -97,39 +349,49 @@ pub async fn feature_usage(
     })
 }
 
-/// A non-primary allocation of the master that a new split takes over as its primary one.
+/// A non-primary allocation of the master that a new split can take over as its primary one.
+#[derive(Clone, Debug)]
 pub struct TransferableAllocation {
     pub server_allocation_uuid: uuid::Uuid,
     pub allocation_uuid: uuid::Uuid,
+    pub ip: String,
+    pub ip_alias: Option<String>,
+    pub port: i32,
     pub notes: Option<String>,
     pub created: chrono::NaiveDateTime,
 }
 
-pub async fn transferable_allocation(
+pub async fn transferable_allocations(
     conn: &mut PgConnection,
     master_uuid: uuid::Uuid,
-) -> Result<Option<TransferableAllocation>, sqlx::Error> {
-    let row = sqlx::query(
+) -> Result<Vec<TransferableAllocation>, sqlx::Error> {
+    let rows = sqlx::query(
         r#"
-        SELECT sa.uuid, sa.allocation_uuid, sa.notes, sa.created
+        SELECT sa.uuid, sa.allocation_uuid, host(na.ip) AS ip, na.ip_alias, na.port, sa.notes, sa.created
         FROM server_allocations sa
         JOIN servers s ON s.uuid = sa.server_uuid
+        JOIN node_allocations na ON na.uuid = sa.allocation_uuid
         WHERE sa.server_uuid = $1
           AND (s.allocation_uuid IS NULL OR sa.uuid != s.allocation_uuid)
         ORDER BY sa.created ASC
-        LIMIT 1
         "#,
     )
     .bind(master_uuid)
-    .fetch_optional(conn)
+    .fetch_all(conn)
     .await?;
 
-    Ok(row.map(|row| TransferableAllocation {
-        server_allocation_uuid: row.get("uuid"),
-        allocation_uuid: row.get("allocation_uuid"),
-        notes: row.get("notes"),
-        created: row.get("created"),
-    }))
+    Ok(rows
+        .into_iter()
+        .map(|row| TransferableAllocation {
+            server_allocation_uuid: row.get("uuid"),
+            allocation_uuid: row.get("allocation_uuid"),
+            ip: row.get("ip"),
+            ip_alias: row.get("ip_alias"),
+            port: row.get("port"),
+            notes: row.get("notes"),
+            created: row.get("created"),
+        })
+        .collect())
 }
 
 /// Gives a transferred allocation back to the master after a failed split creation. A no-op when
@@ -157,32 +419,85 @@ pub async fn restore_allocation(
     Ok(())
 }
 
-/// Disk the master's files currently use, in MB, when the config counts it against the pool.
+/// Moves a deleted split's ports back to its master, up to the master's free allocation slots. Runs in
+/// the split's delete transaction, before the split's row goes. The split's primary allocation is
+/// cleared first so the panel's delete doesn't take it along.
+pub async fn return_ports(
+    transaction: &mut Transaction<'_, Postgres>,
+    split_uuid: uuid::Uuid,
+    master_uuid: uuid::Uuid,
+) -> Result<u64, sqlx::Error> {
+    let free: i64 = sqlx::query_scalar(
+        r#"
+        SELECT GREATEST(
+            s.allocation_limit - (SELECT count(*) FROM server_allocations WHERE server_uuid = s.uuid),
+            0
+        )
+        FROM servers s
+        WHERE s.uuid = $1
+        "#,
+    )
+    .bind(master_uuid)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .unwrap_or(0);
+    if free == 0 {
+        return Ok(0);
+    }
+
+    sqlx::query("UPDATE servers SET allocation_uuid = NULL WHERE uuid = $1")
+        .bind(split_uuid)
+        .execute(&mut **transaction)
+        .await?;
+
+    // the split's primary port first, then the others oldest first
+    let moved = sqlx::query(
+        r#"
+        UPDATE server_allocations
+        SET server_uuid = $2
+        WHERE uuid IN (
+            SELECT sa.uuid
+            FROM server_allocations sa
+            WHERE sa.server_uuid = $1
+            ORDER BY sa.created ASC
+            LIMIT $3
+        )
+        "#,
+    )
+    .bind(split_uuid)
+    .bind(master_uuid)
+    .bind(free)
+    .execute(&mut **transaction)
+    .await?;
+
+    Ok(moved.rows_affected())
+}
+
+/// Disk the master's files currently use, in MB, when the config counts it against the pool. `None`
+/// when it should be counted but Wings couldn't be asked.
 pub async fn disk_usage_mb(
     state: &State,
     master: &Server,
     config: &ServerSplitterSettingsData,
-) -> i64 {
+) -> Option<i64> {
     if !config.include_disk_usage {
-        return 0;
+        return Some(0);
     }
 
-    let Ok(node) = master.node.fetch_cached(&state.database).await else {
-        return 0;
-    };
-    let Ok(resources) = node.fetch_server_resources(&state.database).await else {
-        return 0;
-    };
+    let node = master.node.fetch_cached(&state.database).await.ok()?;
+    let resources = node.fetch_server_resources(&state.database).await.ok()?;
 
-    resources
-        .get(&master.uuid)
-        .map(|r| (r.disk_bytes / 1024 / 1024) as i64)
-        .unwrap_or(0)
+    Some(
+        resources
+            .get(&master.uuid)
+            .map(|r| (r.disk_bytes / 1024 / 1024) as i64)
+            .unwrap_or(0),
+    )
 }
 
-/// The most a split may hold of each resource. `split` is the split being resized (its current
-/// holdings go back into the pool); `transferable_allocation` is whether a new split would take
-/// over one of the master's existing allocations.
+/// The most a split may hold of each resource. `granted` is what the split being resized holds now
+/// (it goes back into the pool); `transferable_allocation` is whether a new split takes over one of the
+/// master's existing allocations. Swap isn't bounded here, see [`split_swap`].
 ///
 /// A limited master always keeps at least 1 cpu/memory/disk (or its reserve, if larger): 0 would
 /// make it unlimited. Feature limits never exceed what the master has left unused.
@@ -191,10 +506,10 @@ pub fn remaining(
     master: &Limits,
     master_usage: &FeatureUsage,
     master_disk_usage_mb: i64,
-    split: Option<&Limits>,
+    granted: Option<&Limits>,
     transferable_allocation: bool,
 ) -> Limits {
-    let held = split.copied().unwrap_or_default();
+    let held = granted.copied().unwrap_or_default();
 
     let resource = |limit: i64, reserved: i64, used: i64, held: i64| {
         if limit > 0 {
@@ -221,6 +536,7 @@ pub fn remaining(
             held.cpu as i64,
         ) as i32,
         memory: resource(master.memory, config.reserved_memory, 0, held.memory),
+        swap: 0,
         disk: resource(
             master.disk,
             config.reserved_disk,
@@ -234,7 +550,7 @@ pub fn remaining(
     }
 }
 
-/// Why `requested` doesn't fit in `remaining`, if it doesn't.
+/// Why `requested` doesn't fit in `remaining`, if it doesn't. Swap isn't checked.
 pub fn exceeded(requested: &Limits, remaining: &Limits) -> Option<&'static str> {
     let over = |requested: i64, remaining: i64| remaining >= 0 && requested > remaining;
 
@@ -293,6 +609,35 @@ pub fn below_usage(requested: &Limits, current: &Limits, usage: &FeatureUsage) -
         })
 }
 
+/// Lower bounds for a split's limits: the minimum size where the master is limited (a smaller current
+/// value may be kept), and what it uses of its feature limits (a lower current limit may be kept).
+pub fn resize_minimum(
+    config: &ServerSplitterSettingsData,
+    master: &Limits,
+    current: &Limits,
+    usage: &FeatureUsage,
+) -> Limits {
+    let resource = |master: i64, minimum: i64, current: i64| {
+        if master > 0 {
+            minimum.min(if current > 0 { current } else { minimum })
+        } else {
+            0
+        }
+    };
+    let feature = |used: i64, current: i32| (used.min(current as i64)) as i32;
+
+    Limits {
+        cpu: resource(master.cpu as i64, config.min_cpu() as i64, current.cpu as i64) as i32,
+        memory: resource(master.memory, config.min_memory(), current.memory),
+        swap: 0,
+        disk: resource(master.disk, config.min_disk(), current.disk),
+        allocations: feature(usage.allocations, current.allocations).max(1),
+        databases: feature(usage.databases, current.databases),
+        backups: feature(usage.backups, current.backups),
+        schedules: feature(usage.schedules, current.schedules),
+    }
+}
+
 /// Locks the master row and reads it fresh. `None` when the master no longer exists.
 pub async fn lock_master(
     transaction: &mut Transaction<'_, Postgres>,
@@ -309,9 +654,10 @@ pub async fn lock_master(
     Server::by_uuid_optional_with_transaction(transaction, master_uuid).await
 }
 
-/// Takes `amount` out of the master's pool (a negative field gives it back). Returns `false`,
-/// changing nothing, when that would leave a limited master unlimited or a feature limit
-/// negative; callers validate against [`remaining`] first, so that means the pool changed.
+/// Takes `amount` out of the master's limits (a negative field gives it back). Returns `false`,
+/// changing nothing, when that would leave a limited master unlimited, its swap negative or a feature
+/// limit negative; callers validate against [`remaining`] first, so that means the pool changed.
+/// cpu/memory/disk of an unlimited master are left alone; [`charge`] never charges them.
 pub async fn debit_master(
     transaction: &mut Transaction<'_, Postgres>,
     master_uuid: uuid::Uuid,
@@ -323,23 +669,26 @@ pub async fn debit_master(
         SET
             cpu = CASE WHEN cpu > 0 THEN cpu - $1 ELSE cpu END,
             memory = CASE WHEN memory > 0 THEN memory - $2 ELSE memory END,
-            disk = CASE WHEN disk > 0 THEN disk - $3 ELSE disk END,
-            allocation_limit = allocation_limit - $4,
-            database_limit = database_limit - $5,
-            backup_limit = backup_limit - $6,
-            schedule_limit = schedule_limit - $7
-        WHERE uuid = $8
+            swap = CASE WHEN swap >= 0 THEN swap - $3 ELSE swap END,
+            disk = CASE WHEN disk > 0 THEN disk - $4 ELSE disk END,
+            allocation_limit = allocation_limit - $5,
+            database_limit = database_limit - $6,
+            backup_limit = backup_limit - $7,
+            schedule_limit = schedule_limit - $8
+        WHERE uuid = $9
             AND (cpu = 0 OR cpu - $1 > 0)
             AND (memory = 0 OR memory - $2 > 0)
-            AND (disk = 0 OR disk - $3 > 0)
-            AND allocation_limit - $4 >= 0
-            AND database_limit - $5 >= 0
-            AND backup_limit - $6 >= 0
-            AND schedule_limit - $7 >= 0
+            AND (swap < 0 OR swap - $3 >= 0)
+            AND (disk = 0 OR disk - $4 > 0)
+            AND allocation_limit - $5 >= 0
+            AND database_limit - $6 >= 0
+            AND backup_limit - $7 >= 0
+            AND schedule_limit - $8 >= 0
         "#,
     )
     .bind(amount.cpu)
     .bind(amount.memory)
+    .bind(amount.swap)
     .bind(amount.disk)
     .bind(amount.allocations)
     .bind(amount.databases)
@@ -352,13 +701,30 @@ pub async fn debit_master(
     Ok(result.rows_affected() == 1)
 }
 
-/// Returns everything `split_uuid` holds to its master. Reads the split's limits in the statement
-/// itself, after the caller has locked the master, so a resize that committed while this
-/// transaction waited for the lock is credited at its new size.
+/// Returns everything `split_uuid` holds to its master and drops its ledger entry. The caller has
+/// locked the master. A split without a ledger entry (created before 1.5.3 and missed by the
+/// migration) gives back its current limits the way 1.5.2 did.
 pub async fn credit_master(
     transaction: &mut Transaction<'_, Postgres>,
     split_uuid: uuid::Uuid,
 ) -> Result<(), sqlx::Error> {
+    let entry = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM serversplitter_splits WHERE split_uuid = $1 RETURNING {LEDGER_COLUMNS}"
+    )))
+    .bind(split_uuid)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .as_ref()
+    .map(map_ledger);
+
+    if let Some(entry) = entry {
+        let refund = entry.refund();
+        if !debit_master(transaction, entry.master_uuid, &refund).await? {
+            tracing::warn!(split = %split_uuid, master = %entry.master_uuid, "could not credit the master for a deleted split");
+        }
+        return Ok(());
+    }
+
     sqlx::query(
         r#"
         UPDATE servers p
@@ -394,35 +760,42 @@ pub async fn refresh_and_sync(state: &State, uuids: &[uuid::Uuid]) {
     }
 }
 
-/// Syncs the master once the transaction currently holding its row lock ends. For hooks that run
-/// inside a panel transaction and have no after-commit callback: waiting for the lock is the
-/// commit signal.
-pub fn refresh_and_sync_after_unlock(state: State, master_uuid: uuid::Uuid) {
+/// Waits until the transaction currently holding `lock_uuid`'s row lock ends. For hooks that run
+/// inside a panel transaction and have no after-commit callback: waiting for the lock is the commit
+/// signal.
+pub async fn wait_for_unlock(state: &State, lock_uuid: uuid::Uuid) {
+    let wait = async {
+        let mut transaction = state.database.write().begin().await?;
+        sqlx::query("SELECT 1 FROM servers WHERE uuid = $1 FOR SHARE")
+            .bind(lock_uuid)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await
+    };
+
+    if let Err(err) = wait.await {
+        tracing::warn!(server = %lock_uuid, "failed to wait for server unlock: {err:?}");
+    }
+}
+
+/// Syncs `uuids` once the transaction holding `lock_uuid`'s row lock ends. Servers that are gone by
+/// then are skipped.
+pub fn sync_after_unlock(state: State, lock_uuid: uuid::Uuid, uuids: Vec<uuid::Uuid>) {
     tokio::spawn(async move {
-        let wait = async {
-            let mut transaction = state.database.write().begin().await?;
-            sqlx::query("SELECT 1 FROM servers WHERE uuid = $1 FOR SHARE")
-                .bind(master_uuid)
-                .execute(&mut *transaction)
-                .await?;
-            transaction.commit().await
-        };
-
-        if let Err(err) = wait.await {
-            tracing::warn!(server = %master_uuid, "failed to wait for master unlock: {err:?}");
-        }
-
-        refresh_and_sync(&state, &[master_uuid]).await;
+        wait_for_unlock(&state, lock_uuid).await;
+        refresh_and_sync(&state, &uuids).await;
     });
 }
 
 /// Set while [`Server::create`] runs for a new split, so the extension's create handler inserts
-/// the server already linked to its master and takes over the master's allocation in the same
-/// transaction.
+/// the server already linked to its master, takes over the master's allocation and writes the
+/// split's ledger entry in the same transaction.
 #[derive(Clone, Copy, Debug)]
 pub struct PendingSplit {
     pub master_uuid: uuid::Uuid,
     pub transferred_server_allocation: Option<uuid::Uuid>,
+    pub granted: Limits,
+    pub charged: Charged,
 }
 
 tokio::task_local! {
@@ -446,6 +819,7 @@ mod tests {
         Limits {
             cpu,
             memory,
+            swap: 0,
             disk,
             allocations: features,
             databases: features,
@@ -571,5 +945,90 @@ mod tests {
         assert!(below_usage(&limits(0, 0, 0, 3), &current, &usage).is_none());
         // a limit that stays below usage (e.g. set by an admin) doesn't block other changes
         assert!(below_usage(&limits(0, 0, 0, 2), &limits(0, 0, 0, 2), &usage).is_none());
+    }
+
+    #[test]
+    fn charge_takes_from_limited_masters_only() {
+        assert_eq!(charge(true, 100, 50), (50, 150));
+        assert_eq!(charge(false, 100, 50), (0, 100));
+    }
+
+    // An admin raises a split while the master is unlimited, then the master becomes limited: shrinking
+    // must not give back more than was ever taken (1.5.2 grew the pool here).
+    #[test]
+    fn shrink_gives_back_at_most_what_was_charged() {
+        assert_eq!(charge(true, 100, -40), (-40, 60));
+        assert_eq!(charge(true, 100, -400), (-100, 0));
+        assert_eq!(charge(true, 0, -400), (0, 0));
+    }
+
+    #[test]
+    fn refund_returns_charged_resources_and_granted_features() {
+        let entry = LedgerEntry {
+            split_uuid: uuid::Uuid::nil(),
+            master_uuid: uuid::Uuid::nil(),
+            granted: limits(100, 2048, 4096, 2),
+            charged: Charged {
+                cpu: 100,
+                memory: 1024,
+                swap: 256,
+                disk: 0,
+            },
+            port_from_master: false,
+        };
+        let refund = entry.refund();
+        assert_eq!(
+            (refund.cpu, refund.memory, refund.swap, refund.disk),
+            (-100, -1024, -256, 0)
+        );
+        assert_eq!(refund.allocations, -2);
+    }
+
+    #[test]
+    fn regrant_moves_the_difference() {
+        let master = limits(300, 4096, 8192, 4);
+        let old = limits(100, 1024, 2048, 1);
+        let charged = Charged {
+            cpu: 100,
+            memory: 1024,
+            swap: 0,
+            disk: 2048,
+        };
+        let new = limits(150, 512, 2048, 2);
+        let (debit, charged) = regrant(&master, true, &old, &charged, &new);
+
+        assert_eq!((debit.cpu, debit.memory, debit.disk), (50, -512, 0));
+        assert_eq!(debit.allocations, 1);
+        assert_eq!((charged.cpu, charged.memory, charged.disk), (150, 512, 2048));
+    }
+
+    #[test]
+    fn pooled_swap_is_capped_by_the_master() {
+        assert_eq!(split_swap(SwapMode::Pooled, 512, 4096, 0), 512);
+        assert_eq!(split_swap(SwapMode::Pooled, 512, 1024, 0), 256);
+        // what the split already holds counts as available on a resize
+        assert_eq!(split_swap(SwapMode::Pooled, 0, 4096, 300), 300);
+        assert_eq!(split_swap(SwapMode::Pooled, 0, 4096, 0), 0);
+        assert_eq!(split_swap(SwapMode::Pooled, -1, 4096, 0), 1024);
+        assert_eq!(split_swap(SwapMode::None, 512, 4096, 0), 0);
+        assert_eq!(split_swap(SwapMode::Copy, 512, 4096, 0), 512);
+    }
+
+    #[test]
+    fn resize_minimum_keeps_smaller_current_values() {
+        let config = config(10, 128, 256);
+        let master = limits(400, 4096, 8192, 4);
+        let usage = FeatureUsage {
+            allocations: 2,
+            databases: 1,
+            ..Default::default()
+        };
+
+        let min = resize_minimum(&config, &master, &limits(5, 512, 512, 3), &usage);
+        assert_eq!((min.cpu, min.memory, min.disk), (5, 128, 256));
+        assert_eq!((min.allocations, min.databases, min.backups), (2, 1, 0));
+
+        let unlimited = resize_minimum(&config, &limits(0, 0, 0, 4), &limits(0, 0, 0, 1), &usage);
+        assert_eq!((unlimited.cpu, unlimited.memory, unlimited.disk), (0, 0, 0));
     }
 }

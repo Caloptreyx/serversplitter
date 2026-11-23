@@ -4,7 +4,8 @@ import { useEffect, useState } from 'react';
 import { useParams } from 'react-router';
 import TableLink from '@/elements/data-display/TableLink.tsx';
 import Alert from '@/elements/feedback/Alert.tsx';
-import { getAdminServerSplits, type ParentServer } from '../api/client.ts';
+import type { ParentServer } from '../api/client.ts';
+import { getAdminServerSplits } from '../api/admin.ts';
 
 /**
  * Notice at the top of every admin page of a split server. The container slot it lives in is
@@ -32,8 +33,9 @@ export default function AdminSplitNotice() {
 
   return (
     <Alert title='Split server' color='orange' icon={<FontAwesomeIcon icon={faCircleInfo} />} mb='md'>
-      This server is a split of <TableLink to={`/admin/servers/${parent.uuid}`}>{parent.name}</TableLink>. Its resources
-      come out of that server&apos;s pool, so change them from the master&apos;s Splitter page rather than here.
+      This server is a split of <TableLink to={`/admin/servers/${parent.uuid}`}>{parent.name}</TableLink>. Limit changes
+      made here are taken from or returned to the master&apos;s pool; use Resize on the master&apos;s Server Splitter
+      card to stay within it.
     </Alert>
   );
 }
