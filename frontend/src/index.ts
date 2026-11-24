@@ -1,5 +1,6 @@
-import type { FC } from 'react';
 import { faNetworkWired } from '@fortawesome/free-solid-svg-icons';
+import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
+import { createElement, type FC } from 'react';
 import { Extension, ExtensionContext } from 'shared';
 import { z } from 'zod';
 import { type FieldDef, insertFieldsAfter } from '@/elements/form-engine/index.ts';
@@ -76,6 +77,11 @@ class ComCaloptreyxServerSplitterExtension extends Extension {
           } satisfies FieldDef),
       });
     });
+
+    // 4. Icon for the `splitter` group in the subuser permission picker (the panel needs one per group)
+    ctx.extensionRegistry.enterPermissionIcons((icons) =>
+      icons.addServerPermissionIcon('splitter', createElement(FontAwesomeIcon, { icon: faNetworkWired })),
+    );
   }
 }
 
