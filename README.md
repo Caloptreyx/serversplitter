@@ -28,6 +28,13 @@ Package name: `com.caloptreyx.serversplitter` · Requires panel `>=1.2.11`
   and are never re-added by sync.
 - Copying subusers needs the subuser permissions and never grants more than the acting user holds.
 - A split's own Splitter page shows its share of the master and links back to it.
+- **Then restart, stop or kill the master**: the New split drawer, **Resize** and **Delete** offer
+  a power action for the master once the change is saved (when the admin allows it, the master is
+  running or starting, and the user has the panel's **Restart** or **Stop** permission on it; kill
+  needs **Stop**, as in the panel). The master gets its new limits first, so a restart already runs
+  with them. If the action fails, the split change stays and the user is told why.
+- An **over-committed** notice on the pool card when the master's plan was lowered below what its
+  splits hold, with how much to free.
 
 ## What you get
 
@@ -39,18 +46,23 @@ Package name: `com.caloptreyx.serversplitter` · Requires panel `>=1.2.11`
   - mirror subuser removals and permission changes from the master;
   - inherit the master's CPU pinning;
   - swap mode: `pooled` (a quarter of the split's memory, taken from the master's swap and capped
-    by what it has left), `none` or `copy`.
+    by what it has left), `none` or `copy`;
+  - **limits set on a master** (see [Billing panels](#billing-panels-and-plan-totals)): *Plan
+    total* or *Master only*;
+  - **master power actions** users may choose after a split change (restart, stop, kill) and the
+    **preselected** one (none by default).
   The bandwidth cap is copied. Other extensions' per-server limits (subdomains, proxies and the
   like) are `0` on splits. KVM/hugepages passthrough is not copied.
 - **Egg rules**: which child eggs may be created from which master eggs. One rule per master egg;
   overlapping rules are rejected.
 - A **Splits** tab listing masters with splits and their health: *balanced*, *drift* (limits
-  changed outside the splitter) or *untracked*. **Reconcile** adopts a split's current limits and
-  moves the difference to or from the master, per master or for all.
+  changed outside the splitter), *untracked* or *over-committed*. **Reconcile** adopts a split's
+  current limits and moves the difference to or from the master, per master or for all.
 - Ledger accounting: every split's share is recorded. Deleting a split returns exactly what it
   took. Admin edits of a split's limits move the difference to or from the master.
-- A **Server Splitter** card on the admin server overview with a pool-aware **Resize**, and a
-  notice on every admin page of a split.
+- A **Server Splitter** card on the admin server overview with a pool-aware **Resize** (which can
+  also restart, stop or kill the master, with the admin permission `nodes.power`), the master's plan
+  total, what its splits hold and what it keeps, and a notice on every admin page of a split.
 - Deleting a master deletes its splits first.
 
 ## Installation
@@ -60,6 +72,39 @@ Download `com_caloptreyx_serversplitter.c7s.zip` from the
 under **Admin → Extensions** or drop it into your heavy image's `build/extensions/` directory and
 `docker compose restart web`. Extensions require the `:heavy` panel image - see the
 [Calagopus docs](https://calagopus.com/docs/panel/extensions/installing-extensions).
+
+## Billing panels and plan totals
+
+Billing panels (Paymenter, WHMCS modules and the like) up- or downgrade a plan by setting the
+server's limits through the admin API. The **Limits set on a master** setting decides what that
+value means for a master with splits. It applies to CPU, memory, disk, and swap when the swap mode
+is `pooled`, whether the change comes from the admin API or the admin server page:
+
+- **Plan total**: the value is the whole plan. The master keeps it minus what its splits were
+  charged; the splits are untouched. Example: a 4 GB master with a 1 GB split keeps 3 GB; the
+  plan goes to 8 GB, the master keeps 7 GB. `0` (unlimited) stays unlimited.
+- **Master only**: the value is what the master keeps and the splits come on top (1.5.4 and
+  earlier).
+
+A value equal to what the master has now is left alone, so saving the admin server page without
+touching its limits changes nothing. That page shows the master's own share; the Server Splitter
+card on its overview shows the plan total next to it.
+
+**Downgrades below what the splits hold.** Running splits are never shrunk and the billing panel's
+request isn't refused. The master is held at its reserve (never above the plan itself) and marked
+**over-committed** on the admin server card, in the Splits tab and on the user's pool card, with
+how much the splits must free. Whatever its splits give back (shrinking or deleting one) pays this
+down first; once it's paid, the master again gets what is freed. Feature limits (ports, databases,
+backups, schedules) aren't part of the plan: they stay what the master keeps.
+
+## Upgrading from 1.5.4
+
+A migration adds the over-commit table; nothing changes on running servers. On an upgraded panel
+**Limits set on a master** starts at *Master only*, so limits your billing panel or admins set keep
+meaning what they meant in 1.5.4. Switch it to *Plan total* if your billing panel sends the plan
+size. New installs start at *Plan total*. Restart, stop and kill are allowed after split changes,
+with *none* preselected, so nothing happens to a master unless a user picks an action (and has
+the power permission for it).
 
 ## Upgrading from 1.5.2
 
@@ -81,8 +126,9 @@ changes on running servers.
    (disabled).
 
 Permissions: server `splitter.read|create|update|delete` (syncing subusers also needs
-`subusers.create|update`), admin `extensions.splitter.read|write` (admin resize also needs
-`servers.update`).
+`subusers.create|update`; a master power action needs `control.restart`, or `control.stop` for stop
+and kill), admin `extensions.splitter.read|write` (admin resize also needs `servers.update`, and
+`nodes.power` for a master power action).
 
 ## Screenshots
 
@@ -118,6 +164,9 @@ Client, under `/api/client/servers/{server}`:
 
 - `GET|POST /splitter`, `GET /splitter/nests`
 - `PATCH|DELETE /splitter/{split}` (`DELETE` takes `?return_port`)
+- `POST /splitter` and `PATCH /splitter/{split}` take `master_power` (`none`, `restart`, `stop`,
+  `kill`) and answer with the split plus `master_power` (`{ action, ok, error }`); `DELETE` takes
+  `?master_power=` and then answers `200` with `{ master_power }` instead of `204`
 - `POST /splitter/{split}/subusers-sync`, `GET /splitter/{split}/subusers`
 - `PUT /splitter/{split}/subusers/{user}/custom`
 
