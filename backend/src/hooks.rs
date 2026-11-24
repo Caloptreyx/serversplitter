@@ -173,7 +173,10 @@ pub fn register() {
                         regrant_split_edit(server, master_uuid, options, &config, state, transaction)
                             .await
                     }
-                    None => cascade_master_changes(server, options, &config, state, transaction).await,
+                    None => {
+                        resize_master_plan(server, options, &config, transaction).await?;
+                        cascade_master_changes(server, options, &config, state, transaction).await
+                    }
                 }
             })
         },
@@ -359,6 +362,73 @@ pub fn untracked_entry(split: &Server, master_uuid: uuid::Uuid, master: &Limits)
         },
         port_from_master: false,
     }
+}
+
+/// Something other than the splitter (the admin UI, the admin API, a billing panel) set a master's
+/// limits. With [`ExternalResize::PlanTotal`](crate::settings::ExternalResize) changed cpu/memory/disk
+/// (and swap when pooled) are the plan total and the master keeps that minus what its splits were
+/// charged. A plan below what the splits hold plus the reserve holds the master at its reserve and
+/// records the overcommit for the splits to free: running splits are never changed here. With
+/// master-only, a changed value is what the master keeps and clears its overcommit. Runs in the
+/// update's transaction under the master's lock; masters without splits are left alone.
+async fn resize_master_plan(
+    master: &Server,
+    options: &mut UpdateServerOptions,
+    config: &ServerSplitterSettingsData,
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), shared::database::DatabaseError> {
+    let Some(limits) = options.limits.as_mut() else {
+        return Ok(());
+    };
+    let Some(fresh) = pool::lock_master(transaction, master.uuid).await? else {
+        return Ok(());
+    };
+    let ledger = pool::ledger_by_master(&mut **transaction, master.uuid).await?;
+    let owed = pool::overcommit(&mut **transaction, master.uuid).await?;
+    if ledger.is_empty() && owed.is_zero() {
+        return Ok(());
+    }
+
+    let charged = ledger
+        .iter()
+        .fold(Charged::default(), |sum, entry| sum.plus(&entry.charged));
+    let current = Limits::of(&fresh);
+    let requested = Limits {
+        cpu: limits.cpu,
+        memory: limits.memory,
+        swap: limits.swap,
+        disk: limits.disk,
+        ..current
+    };
+    let (kept, still_owed) = pool::resize_master(config, &requested, &current, &charged, &owed);
+
+    limits.cpu = kept.cpu;
+    limits.memory = kept.memory;
+    limits.swap = kept.swap;
+    limits.disk = kept.disk;
+
+    if still_owed != owed {
+        pool::save_overcommit(&mut **transaction, master.uuid, &still_owed).await?;
+    }
+    if kept != requested {
+        tracing::info!(
+            master = %master.uuid,
+            "read the master's new limits as its plan total: {}",
+            requested.differences(&kept).join(", ")
+        );
+    }
+    if !still_owed.is_zero() {
+        tracing::warn!(
+            master = %master.uuid,
+            "master is over-committed: its splits must free cpu {}%, memory {}MB, swap {}MB, disk {}MB",
+            still_owed.cpu,
+            still_owed.memory,
+            still_owed.swap,
+            still_owed.disk
+        );
+    }
+
+    Ok(())
 }
 
 /// Suspension and owner changes of a master reach its splits (admin settings, on by default).

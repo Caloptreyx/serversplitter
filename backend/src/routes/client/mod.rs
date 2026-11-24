@@ -2,8 +2,9 @@ use crate::{
     health::{self, SplitHealth},
     hooks::{self, SPLIT_DELETE, SplitDelete},
     model::{ServerExtension, ServerSplitterData},
-    pool::{self, Charged, LedgerEntry, Limits},
-    settings::{ServerSplitterSettingsData, SwapMode},
+    pool::{self, Charged, LedgerEntry, Limits, Overcommit},
+    power::{self, MasterPowerOptions, MasterPowerResult},
+    settings::{MasterPower, ServerSplitterSettingsData, SwapMode},
 };
 use axum::{
     extract::{Path, Query},
@@ -22,7 +23,8 @@ use shared::{
         node_allocation::NodeAllocation,
         server::{
             AdminApiServerLimits, ApiServer, ApiServerBandwidth, ApiServerFeatureLimits,
-            CreateServerOptions, GetServer, GetServerActivityLogger, Server, ServerStatus,
+            CreateServerOptions, GetServer, GetServerActivityLogger, Server, ServerActivityLogger,
+            ServerStatus,
         },
         server_subuser::{CreateServerSubuserOptions, ServerSubuser},
         user::{GetPermissionManager, GetUser, PermissionManager},
@@ -60,6 +62,53 @@ impl From<Limits> for Amounts {
             schedules: limits.schedules,
         }
     }
+}
+
+/// cpu %, memory/swap/disk MB.
+#[derive(ToSchema, Serialize, Clone, Copy, Debug, Default)]
+pub struct ResourceAmounts {
+    pub cpu: i32,
+    pub memory: i64,
+    pub swap: i64,
+    pub disk: i64,
+}
+
+impl From<Charged> for ResourceAmounts {
+    fn from(amounts: Charged) -> Self {
+        Self {
+            cpu: amounts.cpu,
+            memory: amounts.memory,
+            swap: amounts.swap,
+            disk: amounts.disk,
+        }
+    }
+}
+
+impl From<Overcommit> for ResourceAmounts {
+    fn from(amounts: Overcommit) -> Self {
+        Self {
+            cpu: amounts.cpu,
+            memory: amounts.memory,
+            swap: amounts.swap,
+            disk: amounts.disk,
+        }
+    }
+}
+
+impl From<Limits> for ResourceAmounts {
+    fn from(limits: Limits) -> Self {
+        Self {
+            cpu: limits.cpu,
+            memory: limits.memory,
+            swap: limits.swap,
+            disk: limits.disk,
+        }
+    }
+}
+
+/// What the splits of an over-committed master must free, `None` when nothing is owed.
+pub fn overcommit_amounts(owed: Overcommit) -> Option<ResourceAmounts> {
+    (!owed.is_zero()).then(|| owed.into())
 }
 
 #[derive(ToSchema, Serialize)]
@@ -131,6 +180,9 @@ pub struct Pool {
     pub swap_mode: SwapMode,
     pub display_reserved: bool,
     pub health: PoolHealth,
+    /// What the splits must free because the master's plan total was set below what they hold plus
+    /// the reserve. `None` when nothing is owed.
+    pub overcommit: Option<ResourceAmounts>,
 }
 
 #[derive(ToSchema, Serialize)]
@@ -166,6 +218,56 @@ pub struct ClientIndexResponse {
     pub pool: Option<Pool>,
     pub splits: Vec<SplitEntry>,
     pub share: Option<SplitShare>,
+    /// On a master: the power actions the user may run on it after a split change.
+    pub master_power: Option<MasterPowerOptions>,
+}
+
+/// A created or resized split, and the power action sent to its master afterwards.
+#[derive(ToSchema, Serialize)]
+pub struct SplitServerResponse {
+    #[serde(flatten)]
+    pub server: ApiServer,
+    pub master_power: Option<MasterPowerResult>,
+}
+
+#[derive(ToSchema, Serialize)]
+pub struct DeleteSplitResponse {
+    pub master_power: Option<MasterPowerResult>,
+}
+
+/// Whether the acting user holds the panel's power permission for `action` on the master.
+fn may_power(permissions: &PermissionManager, action: MasterPower) -> bool {
+    action
+        .permission()
+        .is_none_or(|permission| permissions.has_server_permission(permission).is_ok())
+}
+
+/// Sends the chosen power action to the master once a split change committed, and logs it on the
+/// master as the panel's power route does. Detached, so a dropped request still sends it.
+async fn run_master_power(
+    state: &State,
+    master_uuid: uuid::Uuid,
+    action: MasterPower,
+    activity_logger: ServerActivityLogger,
+) -> Option<MasterPowerResult> {
+    let wings_action = action.wings()?;
+    let state = state.clone();
+
+    tokio::spawn(async move {
+        let result = power::send(&state, master_uuid, action).await?;
+        if result.ok {
+            activity_logger
+                .log(
+                    "server:power.action",
+                    serde_json::json!({ "action": wings_action }),
+                )
+                .await;
+        }
+        Some(result)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[derive(ToSchema, Serialize)]
@@ -257,6 +359,10 @@ pub struct CreateSplitPayload {
     #[serde(default = "default_true")]
     #[garde(skip)]
     pub sync_subusers: bool,
+    /// Run on the master once the split exists. Needs the panel's power permission for it.
+    #[serde(default)]
+    #[garde(skip)]
+    pub master_power: MasterPower,
 }
 
 #[derive(ToSchema, Validate, Deserialize)]
@@ -279,6 +385,10 @@ pub struct UpdateSplitPayload {
     pub disk: Option<i64>,
     #[garde(dive)]
     pub feature_limits: Option<FeatureLimitsInput>,
+    /// Run on the master once the resize committed. Needs the panel's power permission for it.
+    #[serde(default)]
+    #[garde(skip)]
+    pub master_power: MasterPower,
 }
 
 #[derive(ToSchema, Serialize, Default)]
@@ -511,6 +621,7 @@ async fn build_pool(
     let transferable = pool::transferable_allocations(conn, master.uuid).await?;
     let ledger = pool::ledger_by_master(conn, master.uuid).await?;
     let issues = health::issues(conn, master.uuid).await?;
+    let owed = pool::overcommit(conn, master.uuid).await?;
     let used: i64 = sqlx::query_scalar("SELECT count(*) FROM servers WHERE parent_uuid = $1")
         .bind(master.uuid)
         .fetch_one(&mut *conn)
@@ -600,6 +711,7 @@ async fn build_pool(
                 .map(|issue| format!("{}: {}", issue.split_name, issue.detail))
                 .collect(),
         },
+        overcommit: overcommit_amounts(owed),
     })
 }
 
@@ -655,6 +767,7 @@ mod get_index {
                     health,
                     suspended_by_master: suspended_by_master && server.suspended,
                 }),
+                master_power: None,
             })
             .ok();
         }
@@ -739,6 +852,9 @@ mod get_index {
             pool: Some(pool),
             splits,
             share: None,
+            master_power: Some(power::options(&config, &server, |action| {
+                may_power(&permissions, action)
+            })),
         })
         .ok()
     }
@@ -924,7 +1040,7 @@ mod post_split {
     use super::*;
 
     #[utoipa::path(post, path = "/", responses(
-        (status = CREATED, body = inline(ApiServer)),
+        (status = CREATED, body = inline(SplitServerResponse)),
     ), request_body = inline(CreateSplitPayload))]
     pub async fn route(
         state: GetState,
@@ -953,6 +1069,15 @@ mod post_split {
         let sync_subusers = data.sync_subusers;
         // "Start when done" starts the server, which needs the panel's own permission.
         let start = permissions.has_server_permission("control.start").is_ok();
+
+        let master_power = data.master_power;
+        let config = splitter_config(&state).await?;
+        power::check(
+            &config,
+            &master,
+            master_power,
+            may_power(&permissions, master_power),
+        )?;
 
         // Detached, so a dropped request can't stop it between creating the split and charging
         // the master.
@@ -992,9 +1117,15 @@ mod post_split {
             )
             .await;
 
-        ApiResponse::new_serialized(split.into_api_object(&state, &user).await?)
-            .with_status(StatusCode::CREATED)
-            .ok()
+        let master_power =
+            run_master_power(&state, master.uuid, master_power, activity_logger.0.clone()).await;
+
+        ApiResponse::new_serialized(SplitServerResponse {
+            server: split.into_api_object(&state, &user).await?,
+            master_power,
+        })
+        .with_status(StatusCode::CREATED)
+        .ok()
     }
 
     /// Server variables for a split: every variable of the egg that isn't excluded by its rules, with
@@ -1294,7 +1425,7 @@ mod patch_split {
     use super::*;
 
     #[utoipa::path(patch, path = "/{subserver}", responses(
-        (status = OK, body = inline(ApiServer)),
+        (status = OK, body = inline(SplitServerResponse)),
     ), request_body = inline(UpdateSplitPayload))]
     pub async fn route(
         state: GetState,
@@ -1317,6 +1448,15 @@ mod patch_split {
         if splitter_data(&master).parent_uuid.is_some() {
             return child_server_error();
         }
+
+        let master_power = data.master_power;
+        let config = splitter_config(&state).await?;
+        power::check(
+            &config,
+            &master,
+            master_power,
+            may_power(&permissions, master_power),
+        )?;
 
         // Detached, so a dropped request can't skip syncing the committed limits to Wings.
         let split = tokio::spawn(resize_split(
@@ -1341,7 +1481,14 @@ mod patch_split {
             )
             .await;
 
-        ApiResponse::new_serialized(split.into_api_object(&state, &user).await?).ok()
+        let master_power =
+            run_master_power(&state, master.uuid, master_power, activity_logger.0.clone()).await;
+
+        ApiResponse::new_serialized(SplitServerResponse {
+            server: split.into_api_object(&state, &user).await?,
+            master_power,
+        })
+        .ok()
     }
 }
 
@@ -1518,14 +1665,21 @@ pub struct DeleteQuery {
     /// Give the split's ports back to the master (up to its allocation limit). Default true.
     #[serde(default)]
     pub return_port: Option<bool>,
+    /// Run on the master once the split is gone. Needs the panel's power permission for it.
+    #[serde(default)]
+    pub master_power: Option<MasterPower>,
 }
 
 mod delete_split {
     use super::*;
 
     #[utoipa::path(delete, path = "/{subserver}", responses(
-        (status = NO_CONTENT, description = "Success"),
-    ), params(("return_port" = Option<bool>, Query, description = "Give the split's ports back to the master (default true)")))]
+        (status = NO_CONTENT, description = "Deleted, no power action asked for"),
+        (status = OK, body = inline(DeleteSplitResponse), description = "Deleted, with the master power action's outcome"),
+    ), params(
+        ("return_port" = Option<bool>, Query, description = "Give the split's ports back to the master (default true)"),
+        ("master_power" = Option<MasterPower>, Query, description = "Run on the master once the split is gone: restart, stop or kill"),
+    ))]
     pub async fn route(
         state: GetState,
         permissions: GetPermissionManager,
@@ -1540,6 +1694,15 @@ mod delete_split {
         if splitter_data(&master).parent_uuid.is_some() {
             return child_server_error();
         }
+
+        let master_power = query.master_power.unwrap_or_default();
+        let config = splitter_config(&state).await?;
+        power::check(
+            &config,
+            &master,
+            master_power,
+            may_power(&permissions, master_power),
+        )?;
 
         let split = managed_split(
             &master,
@@ -1577,9 +1740,22 @@ mod delete_split {
             )
             .await;
 
-        ApiResponse::new_serialized(())
-            .with_status(StatusCode::NO_CONTENT)
-            .ok()
+        if master_power == MasterPower::None {
+            return ApiResponse::new_serialized(())
+                .with_status(StatusCode::NO_CONTENT)
+                .ok();
+        }
+
+        ApiResponse::new_serialized(DeleteSplitResponse {
+            master_power: run_master_power(
+                &state,
+                master.uuid,
+                master_power,
+                activity_logger.0.clone(),
+            )
+            .await,
+        })
+        .ok()
     }
 }
 

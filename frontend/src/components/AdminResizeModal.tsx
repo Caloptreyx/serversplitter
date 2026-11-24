@@ -4,8 +4,9 @@ import { httpErrorToHuman } from '@/api/axios.ts';
 import Button from '@/elements/buttons/Button.tsx';
 import { Modal, ModalFooter } from '@/elements/modals/Modal.tsx';
 import { useToast } from '@/providers/ToastProvider.tsx';
-import type { Amounts } from '../api/client.ts';
-import { type AdminSplitSummary, adminResizeSplit } from '../api/admin.ts';
+import type { Amounts, MasterPower } from '../api/client.ts';
+import { type AdminMasterPowerOptions, type AdminSplitSummary, adminResizeSplit } from '../api/admin.ts';
+import MasterPowerSelect, { initialMasterPower, masterPowerOffered, reportMasterPower } from './MasterPowerSelect.tsx';
 
 type FieldKey = 'cpu' | 'memory' | 'disk' | 'allocations' | 'databases' | 'backups' | 'schedules';
 
@@ -22,19 +23,25 @@ const fields: { key: FieldKey; label: string }[] = [
 /** Resizes a split within its master's pool; bounds come from the backend (`max` -1 = unlimited). */
 export default function AdminResizeModal({
   split,
+  masterPower,
   onClose,
   onResized,
 }: {
   split: AdminSplitSummary | null;
+  /** The master's power options (`null` = none offered). */
+  masterPower: AdminMasterPowerOptions | null;
   onClose: () => void;
   onResized: () => void;
 }) {
   const { addToast } = useToast();
   const [values, setValues] = useState<Amounts | null>(null);
   const [saving, setSaving] = useState(false);
+  const [power, setPower] = useState<MasterPower>('none');
+  const powerOffered = masterPowerOffered(masterPower, masterPower?.state ?? null);
 
   useEffect(() => {
     setValues(split ? { ...split.limits } : null);
+    setPower(initialMasterPower(masterPower));
   }, [split]);
 
   const outOfRange =
@@ -46,7 +53,7 @@ export default function AdminResizeModal({
     if (!split || !values) return;
     try {
       setSaving(true);
-      await adminResizeSplit(split.uuid, {
+      const result = await adminResizeSplit(split.uuid, {
         cpu: values.cpu,
         memory: values.memory,
         disk: values.disk,
@@ -56,8 +63,9 @@ export default function AdminResizeModal({
           backups: values.backups,
           schedules: values.schedules,
         },
+        master_power: powerOffered ? power : 'none',
       });
-      addToast(`Resized ${split.name}`, 'success');
+      reportMasterPower(addToast, `Resized ${split.name}`, result);
       onResized();
       onClose();
     } catch (err) {
@@ -93,6 +101,7 @@ export default function AdminResizeModal({
               );
             })}
           </SimpleGrid>
+          {powerOffered && masterPower && <MasterPowerSelect options={masterPower} value={power} onChange={setPower} />}
           <ModalFooter>
             <Button variant='default' onClick={onClose}>
               Cancel

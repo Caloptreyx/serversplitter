@@ -2,7 +2,7 @@
 name = "com_caloptreyx_serversplitter"
 description = "Server Splitter extension for Calagopus"
 authors = ["Caloptreyx"]
-version = "1.5.4"
+version = "1.5.5"
 edition = { workspace = true }
 
 [dependencies]
@@ -26,3 +26,4 @@ indexmap = { workspace = true }
 chrono-tz = { workspace = true }
 schema-extension-core = { workspace = true }
 rule-validator = { workspace = true }
+wings-api = { workspace = true }

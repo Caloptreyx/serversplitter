@@ -1,4 +1,5 @@
 import { bytesToString, mbToBytes } from '@/lib/format/size.ts';
+import type { ResourceAmounts } from '../api/client.ts';
 
 export type PoolResourceKey = 'cpu' | 'memory' | 'disk';
 
@@ -35,6 +36,25 @@ export function formatResource(key: PoolResourceKey, value: number): string {
 /** A limit where `0` means unlimited. */
 export function formatLimit(key: PoolResourceKey, value: number): string {
   return value === 0 ? 'Unlimited' : formatResource(key, value);
+}
+
+/** cpu, memory, disk or swap of a master's plan. */
+export type PlanKey = PoolResourceKey | 'swap';
+
+export const PLAN_LABELS: Record<PlanKey, string> = { ...RESOURCE_LABELS, swap: 'Swap' };
+
+/** A plan limit: `0` means unlimited for cpu/memory/disk, `-1` for swap. */
+export function formatPlanLimit(key: PlanKey, value: number): string {
+  if (key === 'swap') return value === -1 ? 'Unlimited' : formatMb(value);
+  return formatLimit(key, value);
+}
+
+/** The amounts above 0, e.g. `50% CPU, 1 GiB memory`. */
+export function formatOvercommit(amounts: ResourceAmounts): string {
+  return (['cpu', 'memory', 'disk', 'swap'] as const)
+    .filter((key) => amounts[key] > 0)
+    .map((key) => (key === 'cpu' ? `${formatCpu(amounts.cpu)} CPU` : `${formatMb(amounts[key])} ${key}`))
+    .join(', ');
 }
 
 /** A signed change, `±0` when nothing changes. */

@@ -29,6 +29,60 @@ fn default_true() -> bool {
     true
 }
 
+/// How an edit of a master's cpu/memory/disk (and pooled swap) made outside the splitter (admin UI,
+/// admin API, a billing panel) is read.
+#[derive(ToSchema, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalResize {
+    /// The new value is the plan total: the master keeps it minus what its splits were charged.
+    #[default]
+    PlanTotal,
+    /// The new value is what the master keeps; its splits come on top (1.5.4 and earlier).
+    MasterOnly,
+}
+
+/// Configs saved before 1.5.5 keep reading external edits as the master's own share.
+fn upgraded_external_resize() -> ExternalResize {
+    ExternalResize::MasterOnly
+}
+
+/// A power action for the master after one of its splits was created, resized or deleted.
+#[derive(ToSchema, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MasterPower {
+    #[default]
+    None,
+    Restart,
+    Stop,
+    Kill,
+}
+
+impl MasterPower {
+    pub const ACTIONS: [MasterPower; 3] = [MasterPower::Restart, MasterPower::Stop, MasterPower::Kill];
+
+    /// The panel's server permission for this action, as its own power route checks it.
+    pub fn permission(self) -> Option<&'static str> {
+        match self {
+            MasterPower::None => None,
+            MasterPower::Restart => Some("control.restart"),
+            MasterPower::Stop | MasterPower::Kill => Some("control.stop"),
+        }
+    }
+
+    pub fn wings(self) -> Option<wings_api::ServerPowerAction> {
+        match self {
+            MasterPower::None => None,
+            MasterPower::Restart => Some(wings_api::ServerPowerAction::Restart),
+            MasterPower::Stop => Some(wings_api::ServerPowerAction::Stop),
+            MasterPower::Kill => Some(wings_api::ServerPowerAction::Kill),
+        }
+    }
+}
+
+fn default_master_power_actions() -> Vec<MasterPower> {
+    MasterPower::ACTIONS.to_vec()
+}
+
 #[derive(ToSchema, Serialize, Deserialize, Clone, Debug)]
 pub struct ServerSplitterSettingsData {
     pub reserved_cpu: i32,
@@ -62,6 +116,16 @@ pub struct ServerSplitterSettingsData {
     pub inherit_pinned_cpus: bool,
     #[serde(default)]
     pub swap_mode: SwapMode,
+    /// How external edits of a master's limits are read. Missing in configs saved before 1.5.5:
+    /// those keep the old reading (master only), new installs start with the plan total.
+    #[serde(default = "upgraded_external_resize")]
+    pub external_resize: ExternalResize,
+    /// Power actions users may run on the master after a split change, besides none.
+    #[serde(default = "default_master_power_actions")]
+    pub master_power_actions: Vec<MasterPower>,
+    /// Preselected after a split change; none leaves the master alone.
+    #[serde(default)]
+    pub default_master_power: MasterPower,
 }
 
 impl ServerSplitterSettingsData {
@@ -75,6 +139,11 @@ impl ServerSplitterSettingsData {
 
     pub fn min_disk(&self) -> i64 {
         self.minimum_disk.unwrap_or(self.reserved_disk).max(1)
+    }
+
+    /// Whether users may pick `action` after a split change. None is always allowed.
+    pub fn master_power_enabled(&self, action: MasterPower) -> bool {
+        action == MasterPower::None || self.master_power_actions.contains(&action)
     }
 }
 
@@ -96,6 +165,9 @@ impl Default for ServerSplitterSettingsData {
             mirror_subusers: true,
             inherit_pinned_cpus: true,
             swap_mode: SwapMode::Pooled,
+            external_resize: ExternalResize::PlanTotal,
+            master_power_actions: default_master_power_actions(),
+            default_master_power: MasterPower::None,
         }
     }
 }
@@ -147,5 +219,19 @@ mod tests {
         assert!(config.cascade_suspension && config.cascade_owner && config.mirror_subusers);
         assert!(config.inherit_pinned_cpus);
         assert_eq!(config.swap_mode, SwapMode::Pooled);
+
+        // 1.5.5 fields: an upgraded config keeps reading master edits as the master's own share, and
+        // no power action is preselected
+        assert_eq!(config.external_resize, ExternalResize::MasterOnly);
+        assert_eq!(config.default_master_power, MasterPower::None);
+        assert!(config.master_power_enabled(MasterPower::Restart));
+    }
+
+    // Without any stored config (a new install) external edits are plan totals.
+    #[test]
+    fn new_installs_read_master_edits_as_plan_totals() {
+        let config = ServerSplitterSettingsData::default();
+        assert_eq!(config.external_resize, ExternalResize::PlanTotal);
+        assert_eq!(config.default_master_power, MasterPower::None);
     }
 }

@@ -7,7 +7,7 @@
 //! `FOR NO KEY UPDATE` still lets other transactions insert rows referencing the master, which
 //! [`Server::create`] does while a split is being created under the lock.
 
-use crate::settings::{ServerSplitterSettingsData, SwapMode};
+use crate::settings::{ExternalResize, ServerSplitterSettingsData, SwapMode};
 use shared::{
     State,
     database::DatabaseError,
@@ -99,6 +99,34 @@ pub struct Charged {
     pub memory: i64,
     pub swap: i64,
     pub disk: i64,
+}
+
+impl Charged {
+    pub fn plus(&self, other: &Self) -> Self {
+        Self {
+            cpu: self.cpu + other.cpu,
+            memory: self.memory + other.memory,
+            swap: self.swap + other.swap,
+            disk: self.disk + other.disk,
+        }
+    }
+}
+
+/// What the splits of an over-committed master still have to free: its plan total was set below what
+/// they were charged plus the master's reserve, so the master is held above its share of the plan.
+/// Resources given back by its splits pay this down before they reach the master.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Overcommit {
+    pub cpu: i32,
+    pub memory: i64,
+    pub swap: i64,
+    pub disk: i64,
+}
+
+impl Overcommit {
+    pub fn is_zero(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// One split in the ledger: what it was granted and what of that its master was charged.
@@ -284,6 +312,161 @@ pub fn regrant(
             memory: charged_memory,
             swap: charged_swap,
             disk: charged_disk,
+        },
+    )
+}
+
+/// One resource of a master set from outside the splitter, read as a plan total: the master keeps
+/// `total` minus what its splits were charged, but never less than `floor` (its reserve) or more than
+/// `total` itself. Returns `(master, overcommit)`; the overcommit is what the splits hold beyond the
+/// plan, so `master + charged - overcommit == total`. An unlimited total stays unlimited.
+pub fn plan_share(total: i64, charged: i64, floor: i64, unlimited: bool) -> (i64, i64) {
+    if unlimited {
+        return (total, 0);
+    }
+    let share = total - charged.max(0);
+    let master = share.max(floor.min(total));
+    (master, master - share)
+}
+
+/// A master's cpu/memory/swap/disk after an edit from outside the splitter set them to `requested`.
+/// `current` and `owed` are its locked values now, `charged` what its splits were charged in total.
+/// Fields equal to `current` stay as they are, overcommit included: the panel's admin form sends every
+/// limit on each save. Changed fields are plan totals with [`ExternalResize::PlanTotal`] (swap only
+/// when pooled), else what the master keeps, which clears their overcommit. Other fields are `current`.
+pub fn resize_master(
+    config: &ServerSplitterSettingsData,
+    requested: &Limits,
+    current: &Limits,
+    charged: &Charged,
+    owed: &Overcommit,
+) -> (Limits, Overcommit) {
+    let plan = config.external_resize == ExternalResize::PlanTotal;
+    let field = |requested: i64,
+                 current: i64,
+                 charged: i64,
+                 owed: i64,
+                 floor: i64,
+                 unlimited: bool,
+                 plan: bool| {
+        if requested == current {
+            (current, owed)
+        } else if !plan {
+            (requested, 0)
+        } else {
+            plan_share(requested, charged, floor, unlimited)
+        }
+    };
+
+    let (cpu, owed_cpu) = field(
+        requested.cpu as i64,
+        current.cpu as i64,
+        charged.cpu as i64,
+        owed.cpu as i64,
+        config.reserved_cpu.max(1) as i64,
+        requested.cpu <= 0,
+        plan,
+    );
+    let (memory, owed_memory) = field(
+        requested.memory,
+        current.memory,
+        charged.memory,
+        owed.memory,
+        config.reserved_memory.max(1),
+        requested.memory <= 0,
+        plan,
+    );
+    let (swap, owed_swap) = field(
+        requested.swap,
+        current.swap,
+        charged.swap,
+        owed.swap,
+        0,
+        requested.swap < 0,
+        plan && config.swap_mode == SwapMode::Pooled,
+    );
+    let (disk, owed_disk) = field(
+        requested.disk,
+        current.disk,
+        charged.disk,
+        owed.disk,
+        config.reserved_disk.max(1),
+        requested.disk <= 0,
+        plan,
+    );
+
+    (
+        Limits {
+            cpu: cpu as i32,
+            memory,
+            swap,
+            disk,
+            ..*current
+        },
+        Overcommit {
+            cpu: owed_cpu as i32,
+            memory: owed_memory,
+            swap: owed_swap,
+            disk: owed_disk,
+        },
+    )
+}
+
+/// A master's plan total: what it keeps plus what its splits were charged, less what they still owe.
+/// cpu/memory/disk 0 and swap -1 are unlimited, as on the master.
+pub fn plan_total(master: &Limits, charged: &Charged, owed: &Overcommit) -> Charged {
+    let total = |master: i64, charged: i64, owed: i64, limited: bool, unlimited: i64| {
+        if limited {
+            master + charged - owed
+        } else {
+            unlimited
+        }
+    };
+
+    Charged {
+        cpu: total(
+            master.cpu as i64,
+            charged.cpu as i64,
+            owed.cpu as i64,
+            master.cpu > 0,
+            0,
+        ) as i32,
+        memory: total(master.memory, charged.memory, owed.memory, master.memory > 0, 0),
+        swap: total(master.swap, charged.swap, owed.swap, master.swap >= 0, -1),
+        disk: total(master.disk, charged.disk, owed.disk, master.disk > 0, 0),
+    }
+}
+
+/// Splits through what a debit gives back to an over-committed master: what is owed is paid down
+/// first, only the rest reaches the master. Returns the debit to apply and what is still owed.
+pub fn pay_down(amount: &Limits, owed: &Overcommit) -> (Limits, Overcommit) {
+    let field = |amount: i64, owed: i64| {
+        if amount < 0 && owed > 0 {
+            let paid = (-amount).min(owed);
+            (amount + paid, owed - paid)
+        } else {
+            (amount, owed)
+        }
+    };
+
+    let (cpu, owed_cpu) = field(amount.cpu as i64, owed.cpu as i64);
+    let (memory, owed_memory) = field(amount.memory, owed.memory);
+    let (swap, owed_swap) = field(amount.swap, owed.swap);
+    let (disk, owed_disk) = field(amount.disk, owed.disk);
+
+    (
+        Limits {
+            cpu: cpu as i32,
+            memory,
+            swap,
+            disk,
+            ..*amount
+        },
+        Overcommit {
+            cpu: owed_cpu as i32,
+            memory: owed_memory,
+            swap: owed_swap,
+            disk: owed_disk,
         },
     )
 }
@@ -654,15 +837,79 @@ pub async fn lock_master(
     Server::by_uuid_optional_with_transaction(transaction, master_uuid).await
 }
 
+/// What the splits of `master_uuid` still owe it (zero when it isn't over-committed).
+pub async fn overcommit(
+    conn: &mut PgConnection,
+    master_uuid: uuid::Uuid,
+) -> Result<Overcommit, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT cpu, memory, swap, disk FROM serversplitter_overcommit WHERE master_uuid = $1",
+    )
+    .bind(master_uuid)
+    .fetch_optional(conn)
+    .await?;
+
+    Ok(row
+        .map(|row| Overcommit {
+            cpu: row.get("cpu"),
+            memory: row.get("memory"),
+            swap: row.get("swap"),
+            disk: row.get("disk"),
+        })
+        .unwrap_or_default())
+}
+
+/// Records what the splits of `master_uuid` owe it; zero drops the record. The caller has locked the
+/// master.
+pub async fn save_overcommit(
+    conn: &mut PgConnection,
+    master_uuid: uuid::Uuid,
+    owed: &Overcommit,
+) -> Result<(), sqlx::Error> {
+    if owed.is_zero() {
+        sqlx::query("DELETE FROM serversplitter_overcommit WHERE master_uuid = $1")
+            .bind(master_uuid)
+            .execute(conn)
+            .await?;
+        return Ok(());
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO serversplitter_overcommit (master_uuid, cpu, memory, swap, disk)
+        VALUES ($1, $2, $3, $4, $5)
+        ON CONFLICT (master_uuid) DO UPDATE SET
+            cpu = EXCLUDED.cpu,
+            memory = EXCLUDED.memory,
+            swap = EXCLUDED.swap,
+            disk = EXCLUDED.disk,
+            updated = NOW()
+        "#,
+    )
+    .bind(master_uuid)
+    .bind(owed.cpu)
+    .bind(owed.memory)
+    .bind(owed.swap)
+    .bind(owed.disk)
+    .execute(conn)
+    .await?;
+
+    Ok(())
+}
+
 /// Takes `amount` out of the master's limits (a negative field gives it back). Returns `false`,
 /// changing nothing, when that would leave a limited master unlimited, its swap negative or a feature
 /// limit negative; callers validate against [`remaining`] first, so that means the pool changed.
-/// cpu/memory/disk of an unlimited master are left alone; [`charge`] never charges them.
+/// cpu/memory/disk of an unlimited master are left alone; [`charge`] never charges them. What is
+/// given back to an over-committed master pays down its overcommit first ([`pay_down`]).
 pub async fn debit_master(
     transaction: &mut Transaction<'_, Postgres>,
     master_uuid: uuid::Uuid,
     amount: &Limits,
 ) -> Result<bool, sqlx::Error> {
+    let owed = overcommit(&mut **transaction, master_uuid).await?;
+    let (amount, still_owed) = pay_down(amount, &owed);
+
     let result = sqlx::query(
         r#"
         UPDATE servers
@@ -698,7 +945,14 @@ pub async fn debit_master(
     .execute(&mut **transaction)
     .await?;
 
-    Ok(result.rows_affected() == 1)
+    if result.rows_affected() != 1 {
+        return Ok(false);
+    }
+    if still_owed != owed {
+        save_overcommit(&mut **transaction, master_uuid, &still_owed).await?;
+    }
+
+    Ok(true)
 }
 
 /// Returns everything `split_uuid` holds to its master and drops its ledger entry. The caller has
@@ -1030,5 +1284,226 @@ mod tests {
 
         let unlimited = resize_minimum(&config, &limits(0, 0, 0, 4), &limits(0, 0, 0, 1), &usage);
         assert_eq!((unlimited.cpu, unlimited.memory, unlimited.disk), (0, 0, 0));
+    }
+
+    fn charged(cpu: i32, memory: i64, swap: i64, disk: i64) -> Charged {
+        Charged {
+            cpu,
+            memory,
+            swap,
+            disk,
+        }
+    }
+
+    fn master(cpu: i32, memory: i64, swap: i64, disk: i64) -> Limits {
+        Limits {
+            swap,
+            ..limits(cpu, memory, disk, 4)
+        }
+    }
+
+    // A billing panel upgrades a 4 GB plan with a 1 GB split to 8 GB: the master keeps 7 GB, not 8.
+    #[test]
+    fn plan_upgrade_leaves_the_splits_share_out() {
+        let current = master(300, 3072, 768, 15_360);
+        let splits = charged(100, 1024, 256, 5_120);
+        let (kept, owed) = resize_master(
+            &config(10, 128, 256),
+            &master(600, 8192, 2048, 40_960),
+            &current,
+            &splits,
+            &Overcommit::default(),
+        );
+
+        assert_eq!(
+            (kept.cpu, kept.memory, kept.swap, kept.disk),
+            (500, 7168, 1792, 35_840)
+        );
+        assert!(owed.is_zero());
+        // feature limits aren't part of the plan
+        assert_eq!(kept.allocations, current.allocations);
+        assert_eq!(
+            plan_total(&kept, &splits, &owed),
+            charged(600, 8192, 2048, 40_960)
+        );
+    }
+
+    #[test]
+    fn plan_downgrade_that_still_fits_shrinks_only_the_master() {
+        let (kept, owed) = resize_master(
+            &config(10, 128, 256),
+            &master(200, 2048, 512, 10_240),
+            &master(300, 3072, 768, 15_360),
+            &charged(100, 1024, 256, 5_120),
+            &Overcommit::default(),
+        );
+
+        assert_eq!(
+            (kept.cpu, kept.memory, kept.swap, kept.disk),
+            (100, 1024, 256, 5_120)
+        );
+        assert!(owed.is_zero());
+    }
+
+    // A plan below what the splits hold plus the reserve: the master is held at its reserve and the
+    // rest is owed by the splits; the books still add up to the plan.
+    #[test]
+    fn plan_below_the_splits_holds_the_master_at_its_reserve() {
+        let splits = charged(300, 3072, 768, 6_144);
+        let (kept, owed) = resize_master(
+            &config(10, 128, 256),
+            &master(200, 2048, 0, 4_096),
+            &master(100, 1024, 256, 2_048),
+            &splits,
+            &Overcommit::default(),
+        );
+
+        assert_eq!(
+            (kept.cpu, kept.memory, kept.swap, kept.disk),
+            (10, 128, 0, 256)
+        );
+        assert_eq!(
+            owed,
+            Overcommit {
+                cpu: 110,
+                memory: 1152,
+                swap: 768,
+                disk: 2_304,
+            }
+        );
+        assert_eq!(plan_total(&kept, &splits, &owed), charged(200, 2048, 0, 4_096));
+    }
+
+    // A plan smaller than the reserve itself: the master never gets more than the whole plan.
+    #[test]
+    fn plan_below_the_reserve_never_exceeds_the_plan() {
+        assert_eq!(plan_share(100, 0, 128, false), (100, 0));
+        assert_eq!(plan_share(100, 40, 128, false), (100, 40));
+    }
+
+    #[test]
+    fn unlimited_plans_stay_unlimited() {
+        let (kept, owed) = resize_master(
+            &config(10, 128, 256),
+            &master(0, 0, -1, 0),
+            &master(300, 3072, 768, 15_360),
+            &charged(100, 1024, 256, 5_120),
+            &Overcommit {
+                cpu: 5,
+                memory: 5,
+                swap: 5,
+                disk: 5,
+            },
+        );
+
+        assert_eq!((kept.cpu, kept.memory, kept.swap, kept.disk), (0, 0, -1, 0));
+        assert!(owed.is_zero());
+        assert_eq!(
+            plan_total(&kept, &charged(100, 1024, 256, 5_120), &owed),
+            charged(0, 0, -1, 0)
+        );
+    }
+
+    // The admin form sends every limit on each save: values equal to the master's own are untouched,
+    // and so is what its splits still owe.
+    #[test]
+    fn unchanged_values_are_left_alone() {
+        let current = master(10, 128, 0, 256);
+        let owed = Overcommit {
+            cpu: 110,
+            memory: 1152,
+            swap: 768,
+            disk: 2_304,
+        };
+        let (kept, still_owed) = resize_master(
+            &config(10, 128, 256),
+            &current,
+            &current,
+            &charged(300, 3072, 768, 6_144),
+            &owed,
+        );
+
+        assert_eq!(kept, current);
+        assert_eq!(still_owed, owed);
+    }
+
+    #[test]
+    fn master_only_keeps_the_value_and_clears_what_was_owed() {
+        let config = ServerSplitterSettingsData {
+            external_resize: ExternalResize::MasterOnly,
+            ..config(10, 128, 256)
+        };
+        let (kept, owed) = resize_master(
+            &config,
+            &master(200, 2048, 512, 4_096),
+            &master(10, 128, 0, 256),
+            &charged(300, 3072, 768, 6_144),
+            &Overcommit {
+                cpu: 110,
+                memory: 1152,
+                swap: 768,
+                disk: 2_304,
+            },
+        );
+
+        assert_eq!(
+            (kept.cpu, kept.memory, kept.swap, kept.disk),
+            (200, 2048, 512, 4_096)
+        );
+        assert!(owed.is_zero());
+    }
+
+    // Swap not taken from the master isn't part of its plan.
+    #[test]
+    fn unpooled_swap_is_what_the_master_keeps() {
+        let config = ServerSplitterSettingsData {
+            swap_mode: SwapMode::Copy,
+            ..config(10, 128, 256)
+        };
+        let (kept, _) = resize_master(
+            &config,
+            &master(300, 3072, 1024, 15_360),
+            &master(300, 3072, 512, 15_360),
+            &charged(100, 1024, 0, 5_120),
+            &Overcommit::default(),
+        );
+
+        assert_eq!(kept.swap, 1024);
+    }
+
+    // Freeing resources on an over-committed master pays the overcommit off before the master grows.
+    #[test]
+    fn credits_pay_down_the_overcommit_first() {
+        let owed = Overcommit {
+            cpu: 0,
+            memory: 1152,
+            swap: 0,
+            disk: 0,
+        };
+        let refund = Limits {
+            memory: -1024,
+            cpu: -100,
+            allocations: -1,
+            ..Default::default()
+        };
+
+        let (debit, owed) = pay_down(&refund, &owed);
+        assert_eq!((debit.memory, debit.cpu, debit.allocations), (0, -100, -1));
+        assert_eq!(owed.memory, 128);
+
+        let (debit, owed) = pay_down(&refund, &owed);
+        assert_eq!(debit.memory, -896);
+        assert!(owed.is_zero());
+
+        // taking from the master doesn't touch what is owed
+        let take = Limits {
+            memory: 512,
+            ..Default::default()
+        };
+        let owing = Overcommit {
+            memory: 100,
+            ..Default::default()
+        };
+        assert_eq!(pay_down(&take, &owing), (take, owing));
     }
 }

@@ -5,7 +5,9 @@ import Checkbox from '@/elements/input/Checkbox.tsx';
 import TextInput from '@/elements/input/TextInput.tsx';
 import { Modal, ModalFooter } from '@/elements/modals/Modal.tsx';
 import { useToast } from '@/providers/ToastProvider.tsx';
-import { deleteSplit, type SplitEntry } from '../api/client.ts';
+import { useServerStore } from '@/stores/server.ts';
+import { deleteSplit, type MasterPower, type MasterPowerOptions, type SplitEntry } from '../api/client.ts';
+import MasterPowerSelect, { initialMasterPower, masterPowerOffered, reportMasterPower } from './MasterPowerSelect.tsx';
 import { formatLimit } from './splitterFormat.ts';
 
 export default function DeleteSplitModal({
@@ -13,6 +15,7 @@ export default function DeleteSplitModal({
   serverUuid,
   masterName,
   onClose,
+  masterPower,
   onDeleted,
 }: {
   /** The split to delete; `null` keeps the modal closed. */
@@ -20,17 +23,23 @@ export default function DeleteSplitModal({
   serverUuid: string;
   masterName: string;
   onClose: () => void;
+  /** Power actions offered after the delete (`null` = none). */
+  masterPower: MasterPowerOptions | null;
   onDeleted: () => void;
 }) {
   const { addToast } = useToast();
   const [confirmName, setConfirmName] = useState('');
   const [returnPort, setReturnPort] = useState(true);
+  const [power, setPower] = useState<MasterPower>('none');
+  const masterState = useServerStore((s) => s.state);
+  const powerOffered = masterPowerOffered(masterPower, masterState);
   const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     if (!split) return;
     setConfirmName('');
     setReturnPort(true);
+    setPower(initialMasterPower(masterPower));
     setDeleting(false);
   }, [split?.server.uuid]);
 
@@ -39,8 +48,8 @@ export default function DeleteSplitModal({
     setDeleting(true);
 
     try {
-      await deleteSplit(serverUuid, split.server.uuid, returnPort);
-      addToast(`${split.server.name} deleted`, 'success');
+      const result = await deleteSplit(serverUuid, split.server.uuid, returnPort, powerOffered ? power : 'none');
+      reportMasterPower(addToast, `${split.server.name} deleted`, result);
       onClose();
       onDeleted();
     } catch (err) {
@@ -70,6 +79,7 @@ export default function DeleteSplitModal({
             checked={returnPort}
             onChange={(e) => setReturnPort(e.currentTarget.checked)}
           />
+          {powerOffered && masterPower && <MasterPowerSelect options={masterPower} value={power} onChange={setPower} />}
           <TextInput
             label={
               <>

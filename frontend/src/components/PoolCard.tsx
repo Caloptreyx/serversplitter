@@ -2,12 +2,14 @@ import { faCircleCheck, faTriangleExclamation } from '@fortawesome/free-solid-sv
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import { Progress } from '@mantine/core';
 import Card from '@/elements/data-display/Card.tsx';
+import Alert from '@/elements/feedback/Alert.tsx';
 import Tooltip from '@/elements/overlays/Tooltip.tsx';
 import Title from '@/elements/typography/Title.tsx';
 import type { Pool, SplitEntry } from '../api/client.ts';
 import {
   colorVar,
   formatMb,
+  formatOvercommit,
   formatResource,
   type PoolResourceKey,
   RESOURCE_LABELS,
@@ -213,6 +215,13 @@ export default function PoolCard({
         <Title order={4}>Pool</Title>
         <p className='text-sm text-(--mantine-color-dimmed)'>Everything {masterName} owns, and how it is shared</p>
       </div>
+
+      {pool.overcommit && (
+        <Alert color='red' icon={faTriangleExclamation} title='Over-committed'>
+          {masterName}&apos;s plan is smaller than what its splits hold. Free {formatOvercommit(pool.overcommit)} by
+          shrinking or deleting splits; {masterName} is held at its reserve until then.
+        </Alert>
+      )}
 
       <div className='flex flex-col gap-3'>
         {(['cpu', 'memory', 'disk'] as const).map((resource) => (

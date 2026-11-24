@@ -16,16 +16,20 @@ import SegmentedControl from '@/elements/layout/SegmentedControl.tsx';
 import Drawer from '@/elements/overlays/Drawer.tsx';
 import { useServerCan } from '@/plugins/usePermissions.ts';
 import { useToast } from '@/providers/ToastProvider.tsx';
+import { useServerStore } from '@/stores/server.ts';
 import {
   createSplit,
   type FeatureLimitsInput,
   getClientSplitterNests,
+  type MasterPower,
+  type MasterPowerOptions,
   type NestEggItem,
   type Pool,
   type SplitEntry,
   type SplitterPort,
   updateSplit,
 } from '../api/client.ts';
+import MasterPowerSelect, { initialMasterPower, masterPowerOffered, reportMasterPower } from './MasterPowerSelect.tsx';
 import { formatDelta, formatResource, type PoolResourceKey, RESOURCE_LABELS } from './splitterFormat.ts';
 
 /** `max` null = no upper bound. */
@@ -165,6 +169,7 @@ export default function SplitDrawer({
   masterName,
   pool,
   split,
+  masterPower,
 }: {
   opened: boolean;
   onClose: () => void;
@@ -174,11 +179,14 @@ export default function SplitDrawer({
   pool: Pool;
   /** Resize this split; `null` creates a new one. */
   split: SplitEntry | null;
+  /** Power actions offered after the change (`null` = none). */
+  masterPower: MasterPowerOptions | null;
 }) {
   const { addToast } = useToast();
   const isPhone = useMediaQuery('(max-width: 48em)');
   const canStart = useServerCan('control.start');
   const canCreateSubusers = useServerCan('subusers.create');
+  const masterState = useServerStore((s) => s.state);
 
   const [nests, setNests] = useState<Record<string, NestEggItem[]> | null>(null);
   const [name, setName] = useState('');
@@ -198,6 +206,8 @@ export default function SplitDrawer({
   const [featuresOpen, setFeaturesOpen] = useState(false);
   const [variablesOpen, setVariablesOpen] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [power, setPower] = useState<MasterPower>('none');
+  const powerOffered = masterPowerOffered(masterPower, masterState);
 
   const transferable = pool.transferable_ports;
 
@@ -236,6 +246,7 @@ export default function SplitDrawer({
     setSubmitting(false);
     setFeaturesOpen(false);
     setVariablesOpen(false);
+    setPower(initialMasterPower(masterPower));
 
     if (split) {
       setName(split.server.name);
@@ -326,8 +337,9 @@ export default function SplitDrawer({
     setSubmitting(true);
 
     try {
+      const masterPowerChoice = powerOffered ? power : 'none';
       if (split) {
-        await updateSplit(serverUuid, split.server.uuid, {
+        const result = await updateSplit(serverUuid, split.server.uuid, {
           name: trimmedName,
           // always sent: an empty string clears it
           description: description.trim(),
@@ -335,14 +347,15 @@ export default function SplitDrawer({
           memory: resources.memory,
           disk: resources.disk,
           feature_limits: features,
+          master_power: masterPowerChoice,
         });
-        addToast(`${trimmedName} resized`, 'success');
+        reportMasterPower(addToast, `${trimmedName} resized`, result.masterPower);
       } else {
         const changed = (egg?.variables ?? [])
           .filter((v) => (variables[v.env_variable] ?? '') !== (v.default_value ?? ''))
           .map((v) => ({ env_variable: v.env_variable, value: variables[v.env_variable] ?? '' }));
 
-        await createSplit(serverUuid, {
+        const result = await createSplit(serverUuid, {
           name: trimmedName,
           description: description.trim() || undefined,
           egg_uuid: eggUuid!,
@@ -354,8 +367,9 @@ export default function SplitDrawer({
             portType === 'master' && masterPort ? { type: 'master', allocation_uuid: masterPort } : { type: 'node' },
           variables: changed.length > 0 ? changed : undefined,
           sync_subusers: canCreateSubusers && syncSubusers,
+          master_power: masterPowerChoice,
         });
-        addToast(`${trimmedName} created`, 'success');
+        reportMasterPower(addToast, `${trimmedName} created`, result.masterPower);
       }
 
       onClose();
@@ -583,6 +597,8 @@ export default function SplitDrawer({
               : ''}
           </p>
         )}
+
+        {powerOffered && masterPower && <MasterPowerSelect options={masterPower} value={power} onChange={setPower} />}
 
         <div className='flex justify-end gap-2'>
           <Button variant='default' onClick={onClose}>

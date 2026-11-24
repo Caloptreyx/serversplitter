@@ -1,17 +1,34 @@
 import { faSave } from '@fortawesome/free-solid-svg-icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import { Card, Group, NumberInput, Select, SimpleGrid, Stack, Switch, Text, Title } from '@mantine/core';
+import { Card, Checkbox, Group, NumberInput, Select, SimpleGrid, Stack, Switch, Text, Title } from '@mantine/core';
 import { type ReactNode, useEffect, useState } from 'react';
 import { httpErrorToHuman } from '@/api/axios.ts';
 import Button from '@/elements/buttons/Button.tsx';
 import { useToast } from '@/providers/ToastProvider.tsx';
-import type { SwapMode } from '../api/client.ts';
-import { type AdminSettingsResponse, type SplitterSettings, updateAdminSplitterSettings } from '../api/admin.ts';
+import type { MasterPower, MasterPowerAction, SwapMode } from '../api/client.ts';
+import {
+  type AdminSettingsResponse,
+  type ExternalResize,
+  type SplitterSettings,
+  updateAdminSplitterSettings,
+} from '../api/admin.ts';
+import { MASTER_POWER_LABELS } from './MasterPowerSelect.tsx';
 
 const swapModes: { value: SwapMode; label: string }[] = [
   { value: 'pooled', label: "Pooled with the master (memory/4, capped by the master's swap)" },
   { value: 'none', label: 'No swap' },
   { value: 'copy', label: "Copy the master's swap" },
+];
+
+const externalResizeModes: { value: ExternalResize; label: string }[] = [
+  { value: 'plan_total', label: 'Plan total (billing panels set the whole plan)' },
+  { value: 'master_only', label: 'Master only (value is what the master keeps)' },
+];
+
+const masterPowerActions: { value: MasterPowerAction; label: string }[] = [
+  { value: 'restart', label: 'Restart' },
+  { value: 'stop', label: 'Stop' },
+  { value: 'kill', label: 'Kill' },
 ];
 
 function pickSettings(data: AdminSettingsResponse): SplitterSettings {
@@ -30,6 +47,9 @@ function pickSettings(data: AdminSettingsResponse): SplitterSettings {
     mirror_subusers: data.mirror_subusers,
     inherit_pinned_cpus: data.inherit_pinned_cpus,
     swap_mode: data.swap_mode,
+    external_resize: data.external_resize,
+    master_power_actions: data.master_power_actions,
+    default_master_power: data.default_master_power,
   };
 }
 
@@ -192,6 +212,48 @@ export default function AdminGeneralTab({
             allowDeselect={false}
             value={form.swap_mode}
             onChange={(val) => val && set('swap_mode', val as SwapMode)}
+          />
+          <Select
+            disabled={!canWrite}
+            label='Limits set on a master'
+            description='Applies to the CPU, memory, disk (and swap when pooled) of masters with splits, set through the admin UI or admin API.'
+            data={externalResizeModes}
+            allowDeselect={false}
+            value={form.external_resize}
+            onChange={(val) => val && set('external_resize', val as ExternalResize)}
+          />
+          <Checkbox.Group
+            label='Master power actions after a split change'
+            description='Users still need the matching power permission on the master.'
+            value={form.master_power_actions}
+            onChange={(val) => {
+              const actions = val as MasterPowerAction[];
+              setForm((prev) => ({
+                ...prev,
+                master_power_actions: actions,
+                default_master_power:
+                  prev.default_master_power !== 'none' && !actions.includes(prev.default_master_power)
+                    ? 'none'
+                    : prev.default_master_power,
+              }));
+            }}
+          >
+            <Group gap='md' mt='xs'>
+              {masterPowerActions.map((action) => (
+                <Checkbox key={action.value} disabled={!canWrite} value={action.value} label={action.label} />
+              ))}
+            </Group>
+          </Checkbox.Group>
+          <Select
+            disabled={!canWrite}
+            label='Preselected power action'
+            data={(['none', ...form.master_power_actions] as MasterPower[]).map((power) => ({
+              value: power,
+              label: power === 'none' ? 'None' : MASTER_POWER_LABELS[power],
+            }))}
+            allowDeselect={false}
+            value={form.default_master_power}
+            onChange={(val) => val && set('default_master_power', val as MasterPower)}
           />
         </SettingsCard>
 

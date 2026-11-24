@@ -1,5 +1,16 @@
 import { axiosInstance } from '@/api/axios.ts';
-import type { Amounts, FeatureLimitsInput, ParentServer, SplitHealth, SwapMode } from './client.ts';
+import type {
+  Amounts,
+  FeatureLimitsInput,
+  MasterPower,
+  MasterPowerAction,
+  MasterPowerOptions,
+  MasterPowerResult,
+  ParentServer,
+  ResourceAmounts,
+  SplitHealth,
+  SwapMode,
+} from './client.ts';
 
 // Wire format is snake_case (no key transform).
 
@@ -38,7 +49,15 @@ export interface SplitterSettings {
   /** Splits get the master's CPU pinning. */
   inherit_pinned_cpus: boolean;
   swap_mode: SwapMode;
+  /** How external edits of a master's cpu/memory/disk (and swap when pooled) are read. */
+  external_resize: ExternalResize;
+  /** Actions users may choose after creating, resizing or deleting a split. */
+  master_power_actions: MasterPowerAction[];
+  /** The preselected choice. */
+  default_master_power: MasterPower;
 }
+
+export type ExternalResize = 'plan_total' | 'master_only';
 
 export interface AdminSettingsResponse extends SplitterSettings {
   egg_rules: EggRule[];
@@ -72,6 +91,31 @@ export interface AdminServerSplits {
   splits: AdminSplitSummary[];
   /** `feature_limits.splits` of a master. */
   splits_limit: number;
+  /** `null` on a split. */
+  plan: AdminPlan | null;
+  /** `null` on a split. */
+  master_power: AdminMasterPowerOptions | null;
+}
+
+export interface AdminPlan {
+  mode: ExternalResize;
+  /** The master's own limits now (cpu/memory/disk 0 = unlimited, swap -1 = unlimited). */
+  master: ResourceAmounts;
+  /** What its splits were charged (taken from the master). */
+  splits: ResourceAmounts;
+  /** Plan total = master + splits - overcommit (0 where the master is unlimited; swap -1 unlimited). */
+  total: ResourceAmounts;
+  /** What the splits must free; `null` when nothing is owed. */
+  overcommit: ResourceAmounts | null;
+  /** Swap counts towards the plan only when swap_mode is pooled. */
+  swap_pooled: boolean;
+}
+
+export type MasterPowerState = 'offline' | 'starting' | 'stopping' | 'running';
+
+export interface AdminMasterPowerOptions extends MasterPowerOptions {
+  /** The master's power state from its node (`null` when the node couldn't be asked). */
+  state: MasterPowerState | null;
 }
 
 export interface AdminResizePayload {
@@ -79,6 +123,7 @@ export interface AdminResizePayload {
   memory?: number;
   disk?: number;
   feature_limits?: FeatureLimitsInput;
+  master_power?: MasterPower;
 }
 
 export interface PoolIssue {
@@ -101,7 +146,9 @@ export interface AdminMasterRow {
   master: Amounts;
   /** Sum of what its splits were granted. */
   held: Amounts;
-  status: 'balanced' | 'drift';
+  status: 'balanced' | 'drift' | 'overcommitted';
+  /** What the splits must free; `null` when nothing is owed. */
+  overcommit: ResourceAmounts | null;
   issues: PoolIssue[];
 }
 
@@ -145,8 +192,9 @@ export async function getAdminServerSplits(server: string): Promise<AdminServerS
 }
 
 /** Resizes a split through its master's pool. `split` is the split's uuid. */
-export async function adminResizeSplit(split: string, payload: AdminResizePayload): Promise<void> {
-  await axiosInstance.patch(`${base}/servers/${split}/resize`, payload);
+export async function adminResizeSplit(split: string, payload: AdminResizePayload): Promise<MasterPowerResult | null> {
+  const { data } = await axiosInstance.patch(`${base}/servers/${split}/resize`, payload);
+  return data?.master_power ?? null;
 }
 
 export async function getAdminMasters(params: {

@@ -14,6 +14,7 @@ pub mod health;
 pub mod hooks;
 pub mod model;
 pub mod pool;
+pub mod power;
 pub mod routes;
 pub mod settings;
 

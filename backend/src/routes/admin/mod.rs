@@ -1,11 +1,12 @@
 use crate::{
     health::{self, PoolIssue, ReconcileResult, SplitHealth},
-    pool::{self, Limits},
+    pool::{self, Charged, Limits},
+    power::{self, MasterPowerOptions, MasterPowerResult},
     routes::client::{
-        Amounts, ParentServer, UpdateSplitPayload, entry_or_untracked, get_subservers,
-        resize_bounds, resize_split, splitter_data,
+        Amounts, ParentServer, ResourceAmounts, UpdateSplitPayload, entry_or_untracked,
+        get_subservers, overcommit_amounts, resize_bounds, resize_split, splitter_data,
     },
-    settings::{EggRule, ServerSplitterSettingsData, SwapMode},
+    settings::{EggRule, ExternalResize, MasterPower, ServerSplitterSettingsData, SwapMode},
 };
 use axum::{
     extract::{Path, Query},
@@ -54,6 +55,39 @@ pub struct ServerSplitsResponse {
     /// This server's splits, when it is a master server.
     pub splits: Vec<AdminSplitSummary>,
     pub splits_limit: i32,
+    /// How this master's limits relate to its plan, when it isn't a split.
+    pub plan: Option<AdminPlan>,
+    /// The power actions an admin may run on this master after resizing one of its splits.
+    pub master_power: Option<AdminMasterPower>,
+}
+
+/// A master's limits read against its plan: `master + splits - overcommit = total`.
+#[derive(ToSchema, Serialize)]
+pub struct AdminPlan {
+    pub mode: ExternalResize,
+    /// The master's own limits (cpu/memory/disk 0 and swap -1 = unlimited).
+    pub master: ResourceAmounts,
+    /// What its splits were charged.
+    pub splits: ResourceAmounts,
+    /// The plan total (0 where the master is unlimited, swap -1 = unlimited).
+    pub total: ResourceAmounts,
+    /// What its splits must free; `None` when nothing is owed.
+    pub overcommit: Option<ResourceAmounts>,
+    /// Swap counts towards the plan only when splits take it from the master.
+    pub swap_pooled: bool,
+}
+
+#[derive(ToSchema, Serialize)]
+pub struct AdminMasterPower {
+    #[serde(flatten)]
+    pub options: MasterPowerOptions,
+    /// The master's power state on its node; `None` when the node couldn't be asked.
+    pub state: Option<wings_api::ServerState>,
+}
+
+#[derive(ToSchema, Serialize)]
+pub struct ResizeResponse {
+    pub master_power: Option<MasterPowerResult>,
 }
 
 #[derive(ToSchema, Serialize)]
@@ -94,6 +128,12 @@ pub struct SettingsFields {
     pub inherit_pinned_cpus: bool,
     #[garde(skip)]
     pub swap_mode: SwapMode,
+    #[garde(skip)]
+    pub external_resize: ExternalResize,
+    #[garde(skip)]
+    pub master_power_actions: Vec<MasterPower>,
+    #[garde(skip)]
+    pub default_master_power: MasterPower,
 }
 
 impl SettingsFields {
@@ -113,6 +153,9 @@ impl SettingsFields {
             mirror_subusers: config.mirror_subusers,
             inherit_pinned_cpus: config.inherit_pinned_cpus,
             swap_mode: config.swap_mode,
+            external_resize: config.external_resize,
+            master_power_actions: config.master_power_actions.clone(),
+            default_master_power: config.default_master_power,
         }
     }
 }
@@ -202,7 +245,7 @@ mod put_settings {
         state: GetState,
         permissions: GetPermissionManager,
         activity_logger: GetAdminActivityLogger,
-        shared::Payload(data): shared::Payload<SettingsFields>,
+        shared::Payload(mut data): shared::Payload<SettingsFields>,
     ) -> ApiResponseResult {
         permissions.has_admin_permission("extensions.splitter.write")?;
 
@@ -210,6 +253,21 @@ mod put_settings {
             return ApiResponse::new_serialized(ApiError::new_strings_value(errors))
                 .with_status(StatusCode::BAD_REQUEST)
                 .ok();
+        }
+
+        // in a fixed order, without none (always allowed) or repeats
+        data.master_power_actions = MasterPower::ACTIONS
+            .into_iter()
+            .filter(|action| data.master_power_actions.contains(action))
+            .collect();
+        if data.default_master_power != MasterPower::None
+            && !data.master_power_actions.contains(&data.default_master_power)
+        {
+            return ApiResponse::error(
+                "The preselected power action must be one of the actions users may choose.",
+            )
+            .with_status(StatusCode::BAD_REQUEST)
+            .ok();
         }
 
         let mut settings = state.settings.get_mut().await?;
@@ -229,6 +287,9 @@ mod put_settings {
         config.mirror_subusers = data.mirror_subusers;
         config.inherit_pinned_cpus = data.inherit_pinned_cpus;
         config.swap_mode = data.swap_mode;
+        config.external_resize = data.external_resize;
+        config.master_power_actions = data.master_power_actions.clone();
+        config.default_master_power = data.default_master_power;
 
         settings.save().await?;
 
@@ -415,6 +476,8 @@ mod get_server_splits {
                 }),
                 splits: Vec::new(),
                 splits_limit: 0,
+                plan: None,
+                master_power: None,
             })
             .ok();
         }
@@ -457,10 +520,38 @@ mod get_server_splits {
             });
         }
 
+        let ledger = pool::ledger_by_master(&mut conn, server.uuid).await?;
+        let owed = pool::overcommit(&mut conn, server.uuid).await?;
+        let charged = ledger
+            .iter()
+            .fold(Charged::default(), |sum, entry| sum.plus(&entry.charged));
+        let master_limits = Limits::of(&server);
+        let plan = AdminPlan {
+            mode: config.external_resize,
+            master: master_limits.into(),
+            splits: charged.into(),
+            total: pool::plan_total(&master_limits, &charged, &owed).into(),
+            overcommit: overcommit_amounts(owed),
+            swap_pooled: config.swap_mode == SwapMode::Pooled,
+        };
+
+        let may_power = permissions.has_admin_permission("nodes.power").is_ok();
+        let options = power::options(&config, &server, |_| may_power);
+        let master_state = if options.allowed.is_empty() {
+            None
+        } else {
+            power::state_of(&state, &server).await
+        };
+
         ApiResponse::new_serialized(ServerSplitsResponse {
             parent: None,
             splits,
             splits_limit: data.splits,
+            plan: Some(plan),
+            master_power: Some(AdminMasterPower {
+                options,
+                state: master_state,
+            }),
         })
         .ok()
     }
@@ -470,7 +561,7 @@ mod patch_resize {
     use super::*;
 
     #[utoipa::path(patch, path = "/servers/{split}/resize", responses(
-        (status = OK, body = inline(EmptyResponse)),
+        (status = OK, body = inline(ResizeResponse)),
     ), request_body = inline(UpdateSplitPayload))]
     pub async fn route(
         state: GetState,
@@ -498,6 +589,17 @@ mod patch_resize {
                 .ok();
         };
 
+        // the master power action needs the panel's admin power permission (`nodes.power`)
+        let master_power = data.master_power;
+        let config = splitter_config(&state).await?;
+        let master = Server::by_uuid(&state.database, master_uuid).await?;
+        power::check(
+            &config,
+            &master,
+            master_power,
+            permissions.has_admin_permission("nodes.power").is_ok(),
+        )?;
+
         let resized = tokio::spawn(resize_split(
             state.0.clone(),
             master_uuid,
@@ -510,6 +612,14 @@ mod patch_resize {
             true,
         ))
         .await??;
+
+        let master_power = {
+            let state = state.0.clone();
+            tokio::spawn(async move { power::send(&state, master_uuid, master_power).await })
+                .await
+                .ok()
+                .flatten()
+        };
 
         activity_logger
             .log(
@@ -524,11 +634,13 @@ mod patch_resize {
                     "databases": resized.database_limit,
                     "backups": resized.backup_limit,
                     "schedules": resized.schedule_limit,
+                    "master_power": master_power.as_ref().map(|result| result.action),
+                    "master_power_error": master_power.as_ref().and_then(|result| result.error.clone()),
                 }),
             )
             .await;
 
-        ApiResponse::new_serialized(EmptyResponse {}).ok()
+        ApiResponse::new_serialized(ResizeResponse { master_power }).ok()
     }
 }
 
@@ -555,8 +667,11 @@ pub struct MasterRow {
     pub splits_limit: i32,
     pub master: Amounts,
     pub held: Amounts,
+    /// `overcommitted` (its splits must free resources), else `drift` (issues) or `balanced`.
     pub status: &'static str,
     pub issues: Vec<PoolIssue>,
+    /// What its splits must free; `None` when nothing is owed.
+    pub overcommit: Option<ResourceAmounts>,
 }
 
 #[derive(ToSchema, Serialize)]
@@ -575,7 +690,7 @@ pub struct MastersQuery {
     pub per_page: Option<usize>,
     #[serde(default)]
     pub search: Option<String>,
-    /// `drift`: only masters whose pool needs attention.
+    /// `drift`: only masters whose pool needs attention (issues or an overcommit).
     #[serde(default)]
     pub status: Option<String>,
 }
@@ -589,7 +704,7 @@ mod get_masters {
         ("page" = Option<usize>, Query, description = "1-based page"),
         ("per_page" = Option<usize>, Query, description = "rows per page (max 100)"),
         ("search" = Option<String>, Query, description = "master name, owner username or node name"),
-        ("status" = Option<String>, Query, description = "`drift` for masters that need attention"),
+        ("status" = Option<String>, Query, description = "`drift` for masters that need attention (issues or an overcommit)"),
     ))]
     pub async fn route(
         state: GetState,
@@ -617,6 +732,7 @@ mod get_masters {
             WHERE (
                 EXISTS (SELECT 1 FROM servers s WHERE s.parent_uuid = m.uuid)
                 OR EXISTS (SELECT 1 FROM serversplitter_splits l WHERE l.master_uuid = m.uuid)
+                OR EXISTS (SELECT 1 FROM serversplitter_overcommit o WHERE o.master_uuid = m.uuid)
             )
             AND (
                 $1::text IS NULL
@@ -634,15 +750,16 @@ mod get_masters {
         let mut rows = Vec::new();
         for master_uuid in candidates {
             let issues = health::issues(&mut conn, master_uuid).await?;
-            if query.status.as_deref() == Some("drift") && issues.is_empty() {
+            let owed = pool::overcommit(&mut conn, master_uuid).await?;
+            if query.status.as_deref() == Some("drift") && issues.is_empty() && owed.is_zero() {
                 continue;
             }
-            rows.push((master_uuid, issues));
+            rows.push((master_uuid, issues, owed));
         }
 
         let total = rows.len();
         let mut masters = Vec::new();
-        for (master_uuid, issues) in rows.into_iter().skip((page - 1) * per_page).take(per_page) {
+        for (master_uuid, issues, owed) in rows.into_iter().skip((page - 1) * per_page).take(per_page) {
             let Some(master) = Server::by_uuid_optional(&state.database, master_uuid).await? else {
                 continue;
             };
@@ -673,8 +790,15 @@ mod get_masters {
                 splits_limit: splitter_data(&master).splits,
                 master: Limits::of(&master).into(),
                 held: held.into(),
-                status: if issues.is_empty() { "balanced" } else { "drift" },
+                status: if !owed.is_zero() {
+                    "overcommitted"
+                } else if issues.is_empty() {
+                    "balanced"
+                } else {
+                    "drift"
+                },
                 issues,
+                overcommit: overcommit_amounts(owed),
             });
         }
 

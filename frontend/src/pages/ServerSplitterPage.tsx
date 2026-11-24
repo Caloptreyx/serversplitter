@@ -241,6 +241,7 @@ export default function ServerSplitterPage() {
           masterName={server.name}
           pool={pool}
           split={drawerSplit}
+          masterPower={data.master_power}
         />
       )}
       <DeleteSplitModal
@@ -249,6 +250,7 @@ export default function ServerSplitterPage() {
         masterName={server.name}
         onClose={() => setDeleting(null)}
         onDeleted={load}
+        masterPower={data.master_power}
       />
       <SplitSubusersModal
         split={subusersOf}

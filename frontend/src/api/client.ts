@@ -20,6 +20,33 @@ export interface Amounts {
   schedules: number;
 }
 
+/** cpu %, memory/swap/disk MB. */
+export interface ResourceAmounts {
+  cpu: number;
+  memory: number;
+  swap: number;
+  disk: number;
+}
+
+export type MasterPowerAction = 'restart' | 'stop' | 'kill';
+export type MasterPower = 'none' | MasterPowerAction;
+
+/**
+ * What the user may pick after a split change. `allowed` is already filtered by the admin setting, the
+ * user's power permission on the master and the master's state.
+ */
+export interface MasterPowerOptions {
+  allowed: MasterPowerAction[];
+  default: MasterPower;
+}
+
+/** Result of the power action sent after the split change committed. A failure never undoes the split change. */
+export interface MasterPowerResult {
+  action: MasterPowerAction;
+  ok: boolean;
+  error: string | null;
+}
+
 /** cpu, memory, swap or disk of a master's pool. All values are MB or %, `0` = unlimited. */
 export interface PoolResource {
   /** The master's own limit right now (`0` = unlimited, `-1` = unlimited swap). */
@@ -84,6 +111,8 @@ export interface Pool {
   /** When false, `reserved` is shown as free space (admin setting "display reserved limits"). */
   display_reserved: boolean;
   health: PoolHealth;
+  /** What the splits must free because the master's plan is smaller than they hold + the reserve. */
+  overcommit: ResourceAmounts | null;
 }
 
 export interface SplitEntry {
@@ -124,6 +153,8 @@ export interface SplitterClientIndex {
   splits: SplitEntry[];
   /** On a split: what it holds of its master's pool. */
   share: SplitShare | null;
+  /** On a master: the power actions offered after a split change (`null` on a split). */
+  master_power: MasterPowerOptions | null;
 }
 
 export interface EggVariable {
@@ -163,6 +194,7 @@ export interface CreateSplitPayload {
   variables?: { env_variable: string; value: string }[];
   /** Copy the master's subusers; needs `subusers.create` (the API answers 403 otherwise). */
   sync_subusers: boolean;
+  master_power?: MasterPower;
 }
 
 export interface UpdateSplitPayload {
@@ -173,6 +205,12 @@ export interface UpdateSplitPayload {
   memory?: number;
   disk?: number;
   feature_limits?: FeatureLimitsInput;
+  master_power?: MasterPower;
+}
+
+export interface SplitChangeResult {
+  server: Server;
+  masterPower: MasterPowerResult | null;
 }
 
 export interface SyncResult {
@@ -210,18 +248,39 @@ export async function getClientSplitterNests(server: string): Promise<Record<str
   return data;
 }
 
-export async function createSplit(server: string, payload: CreateSplitPayload): Promise<Server> {
+function toSplitChangeResult(data: Record<string, unknown>): SplitChangeResult {
+  const { master_power: masterPower, ...server } = data;
+  return {
+    server: parseFromApi(serverSchema, server),
+    masterPower: (masterPower as MasterPowerResult | null | undefined) ?? null,
+  };
+}
+
+export async function createSplit(server: string, payload: CreateSplitPayload): Promise<SplitChangeResult> {
   const { data } = await axiosInstance.post(base(server), payload);
-  return parseFromApi(serverSchema, data);
+  return toSplitChangeResult(data);
 }
 
-export async function updateSplit(server: string, split: string, payload: UpdateSplitPayload): Promise<Server> {
+export async function updateSplit(
+  server: string,
+  split: string,
+  payload: UpdateSplitPayload,
+): Promise<SplitChangeResult> {
   const { data } = await axiosInstance.patch(`${base(server)}/${split}`, payload);
-  return parseFromApi(serverSchema, data);
+  return toSplitChangeResult(data);
 }
 
-export async function deleteSplit(server: string, split: string, returnPort: boolean): Promise<void> {
-  await axiosInstance.delete(`${base(server)}/${split}`, { params: { return_port: returnPort } });
+/** `null` when no power action was requested (204). */
+export async function deleteSplit(
+  server: string,
+  split: string,
+  returnPort: boolean,
+  masterPower: MasterPower = 'none',
+): Promise<MasterPowerResult | null> {
+  const params: Record<string, string | boolean> = { return_port: returnPort };
+  if (masterPower !== 'none') params.master_power = masterPower;
+  const { data } = await axiosInstance.delete(`${base(server)}/${split}`, { params });
+  return data?.master_power ?? null;
 }
 
 export async function syncSubusers(server: string, split: string): Promise<SyncResult> {

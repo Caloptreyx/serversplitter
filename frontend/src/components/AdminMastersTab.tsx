@@ -38,6 +38,7 @@ import {
   reconcileAll,
   reconcileMaster,
 } from '../api/admin.ts';
+import { formatOvercommit } from './splitterFormat.ts';
 
 const PER_PAGE = 25;
 const COLUMNS = 6;
@@ -160,7 +161,8 @@ export default function AdminMastersTab({ canWrite }: { canWrite: boolean }) {
             </Title>
             <Text size='xs' c='dimmed'>
               Drift means a split&apos;s limits were changed outside the splitter; Reconcile adopts the current limits
-              and moves the difference to or from the master.
+              and moves the difference to or from the master. Over-committed means the master&apos;s plan is smaller
+              than what its splits hold plus the reserve.
             </Text>
           </div>
           {canWrite && (
@@ -248,18 +250,20 @@ export default function AdminMastersTab({ canWrite }: { canWrite: boolean }) {
                             ) : (
                               <UnstyledButton onClick={() => toggleExpanded(row.uuid)} aria-expanded={isOpen}>
                                 <Badge
-                                  color='orange'
+                                  color={row.status === 'overcommitted' ? 'red' : 'orange'}
                                   variant='light'
                                   rightSection={<FontAwesomeIcon icon={isOpen ? faChevronDown : faChevronRight} />}
                                   className='cursor-pointer'
                                 >
-                                  Needs attention ({row.issues.length})
+                                  {row.status === 'overcommitted'
+                                    ? 'Over-committed'
+                                    : `Needs attention (${row.issues.length})`}
                                 </Badge>
                               </UnstyledButton>
                             )}
                           </Table.Td>
                           <Table.Td>
-                            {canWrite && row.status === 'drift' && (
+                            {canWrite && row.issues.length > 0 && (
                               <Button
                                 size='xs'
                                 variant='outline'
@@ -274,10 +278,16 @@ export default function AdminMastersTab({ canWrite }: { canWrite: boolean }) {
                             )}
                           </Table.Td>
                         </Table.Tr>
-                        {isOpen && row.status === 'drift' && (
+                        {isOpen && row.status !== 'balanced' && (
                           <Table.Tr>
                             <Table.Td colSpan={COLUMNS} className='bg-(--mantine-color-default-hover)'>
                               <Stack gap={4}>
+                                {row.overcommit && (
+                                  <Text size='xs' c='red'>
+                                    <b>Over-committed</b> · the plan is smaller than what the splits hold plus the
+                                    reserve. Free {formatOvercommit(row.overcommit)} by shrinking or deleting splits.
+                                  </Text>
+                                )}
                                 {row.issues.map((issue) => (
                                   <Text key={`${issue.split_uuid}-${issue.kind}`} size='xs'>
                                     <TableLink to={`/admin/servers/${issue.split_uuid}`}>{issue.split_name}</TableLink>
